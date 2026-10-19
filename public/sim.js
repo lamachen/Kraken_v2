@@ -123,7 +123,11 @@ const CPG_HZ_MAX = 1.70;     //   (in Vielfachen von CPG_BASE_HZ)
 const SUCK_ON    = 0.15;     // ab hier haftet der Saugnapf an
 const SUCK_OFF   = -0.15;    // erst hierunter lässt er wieder los (Hysterese)
 const GRIP_BREAK = 22;       // px — ab welcher Dehnung ein Saugnapf abreißt
-const GRIP_MAX_TIME = 3.0;   // s — wie lange ein Saugnapf maximal hält
+const GRIP_MAX_TIME = 0;     // 0 = deaktiviert. Ein Saugnapf hat keinen Timer —
+                             // automatisches Loslassen nach 3 s war reines Scripting
+                             // und physikalisch unsinnig. Ein Anker hält jetzt, bis er
+                             // mechanisch abreißt (GRIP_BREAK) oder die KI ihn über die
+                             // SUCK_OFF-Hysterese selbst löst.
 const CPG_BASE_HZ=1.15;      // Grundfrequenz der Armwelle
 const CPG_WAVE_NUMBER=1.0;   // Phasenversatz pro Arm (1.0 = volle metachronale Welle)
 const PULL_ASYM=1.8;         // >1 = langsam strecken, schnell ziehen.
@@ -743,7 +747,7 @@ class SuctionCup{
     if(!this.gripped)return false;
     this.gTime += DT;
     if(this.cd>0)this.cd-=DT;
-    if(this.gTime > GRIP_MAX_TIME) { this.release(); return false; }
+    if(GRIP_MAX_TIME > 0 && this.gTime > GRIP_MAX_TIME) { this.release(); return false; }
     // Breaking force check from TIP position
     const tipLen = CONN_SL / 2;
     const tpos = { x: pt.x + Math.cos(pt.body.angle)*tipLen, y: pt.y + Math.sin(pt.body.angle)*tipLen };
@@ -792,7 +796,7 @@ class Connectarcle{
 
     // Muskel-/CPG-Zustand
     this.nnTorques=[0,0,0];
-    this.ctrl={shoulder:0,curl:0,wave:0};
+    this.ctrl={shoulder:0,curl:0,wave:0,waveDirect:0};
     this.phase=0;
     this.tipContact=0;
     this.gripLoad=0;
@@ -939,15 +943,34 @@ class Connectarcle{
 
   setTorques(t1,t2,t3){ this.nnTorques=[t1,t2,t3]; }
   /** Neue Steuerung: Schulter-Ziel, Ruhekrümmung, Wellenamplitude, CPG-Phase. */
-  setControl(shoulder,curl,wave,phase){ this.ctrl.shoulder=shoulder;this.ctrl.curl=curl;this.ctrl.wave=wave;this.phase=phase; }
+  setControl(shoulder,curl,wave,phase,waveDirect){
+    this.ctrl.shoulder=shoulder;this.ctrl.curl=curl;this.ctrl.wave=wave;this.phase=phase;
+    // waveDirect = der NN-Ausgang, der OHNE CPG den Gelenkwinkel direkt steuert.
+    // Sonst wäre out[2+k*4+1] ein toter Ausgang.
+    this.ctrl.waveDirect=waveDirect||0;
+  }
   setBase(bx,by,orgAng){ this.worldRestAng=orgAng+this.relAng; }
 
-  /** metachronale Welle: Phase läuft von der Schulter zur Spitze */
+  /**
+   * Gelenkwinkelbeitrag der CPG-Welle.
+   *
+   * ⚠ `OVR.cpgWave` ist standardmäßig AUS — Absicht.
+   * Diese Welle war eine HANDGESCHRIEBENE Gangkurve: ein Sinus, über PULL_ASYM
+   * geformt zu „langsam strecken, schnell ziehen", dazu feste Phasenversätze
+   * k·2π/6. Das Netz durfte nur die Amplitude skalieren — der Rhythmus selbst war
+   * vorgegeben. Genau das soll dieses Projekt nicht sein.
+   *
+   * Mit cpgWave=false kommt der Zielwinkel jedes Gelenks ausschließlich aus
+   * `ctrl.curl + ctrl.waveDirect`, zwei direkten NN-Ausgängen pro Arm. Den
+   * Rhythmus muss das Netz selbst erzeugen: über die 27 rekurrenten Eingänge
+   * (prevOut) hat es ein Gedächtnis, über [27]/[28] eine Phasenuhr als
+   * Zeitreferenz. Eine Uhr ist keine Gangart.
+   */
   waveAt(i){
+    if(!OVR.cpgWave) return 0;
     const t=CONN_SEGS>1?i/(CONN_SEGS-1):0;
     const ph=this.phase-t*Math.PI*1.35;
     const s=0.5+0.5*Math.sin(ph);
-    // asymmetrisch geformt: lange Streckphase, kurze kräftige Zugphase
     return (Math.pow(s,PULL_ASYM)*2-1)*this.ctrl.wave*JOINT_LIMIT;
   }
 
@@ -979,7 +1002,7 @@ class Connectarcle{
     for(let i=1;i<n;i++){
       const A=this.pts[i-1].body, B=this.pts[i].body;
       const rel=angDiff(B.angle,A.angle);
-      const tgt=clamp(this.ctrl.curl+this.waveAt(i),-JOINT_LIMIT,JOINT_LIMIT);
+      const tgt=clamp(this.ctrl.curl+this.waveAt(i)+this.ctrl.waveDirect,-JOINT_LIMIT,JOINT_LIMIT);
       const av=B.angularVelocity-A.angularVelocity;
       let tau=(MUSCLE_KP*(tgt-rel)-MUSCLE_KD*av);
       tau=clamp(tau,-1,1)*MUSCLE_TMAX*T*SUB_COMP;
@@ -1402,8 +1425,9 @@ class Organism{
       c.setControl(
         clamp(oShoulder*eMult,-1,1)*SHOULDER_LIMIT,
         clamp(oCurl*eMult,-1,1)*JOINT_LIMIT*0.8,
-        clamp(0.5+oWave*eMult,0,1.6),
-        this.cpg + (c.cpgOffset||0)
+        clamp(0.5+oWave*eMult,0,1.6),                 // CPG-Amplitude — nur wenn OVR.cpgWave
+        this.cpg + (c.cpgOffset||0),
+        clamp(oWave*eMult,-1,1)*JOINT_LIMIT*0.85      // direkter Gelenkwinkel, ohne CPG
       );
       c.suctionOn=suctionOn;
       c.setBase(this.x,this.y,this.ang);
@@ -1819,7 +1843,10 @@ class PlaySession{
 // ─── GLOBAL STATE ─────────────────────────────────────────
 let evlv=null,playS=null,simMode='TRAIN';
 let paused=false,speed=1,autoEvo=true,popSz=MOB?6:8,mapRegenInterval=5;
-const OVR={ch:true,sw:false,lt:false,col:false,ai:true,noCol:false,floorGrip:true};
+// cpgWave = false ist DEFAULT und bleibt es: keine handgeschriebene Gangkurve.
+// Der Schalter existiert nur, um den Unterschied messbar zu machen (A/B), nicht
+// weil das Spiel ihn braucht.
+const OVR={ch:true,sw:false,lt:false,col:false,ai:true,noCol:false,floorGrip:true,cpgWave:false};
 let _spsAcc=0,_spsT=0,_sps=0;
 
 function setMode(m){

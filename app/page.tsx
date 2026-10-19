@@ -218,7 +218,7 @@ canvas{position:fixed;inset:0;display:block;z-index:0}
       <option value="10">Regen/10G</option><option value="999">Fixed</option>
     </select></div></div>
   <div class="fg"><div class="fl">View & Debug</div>
-    <div class="fr"><button class="b on" id="bch" onclick="window.tog ? window.tog('ch') : void 0">CHEM</button><button class="b" id="bsw" onclick="window.tog ? window.tog('sw') : void 0">ECHO</button><button class="b" id="blt" onclick="window.tog ? window.tog('lt') : void 0">LIGHT</button><button class="b" id="bcol" onclick="window.tog ? window.tog('col') : void 0">COLLIDERS</button><button class="b on" id="bai" onclick="window.tog ? window.tog('ai') : void 0">AI CTRL</button><button class="b" id="bnoCol" onclick="window.tog ? window.tog('noCol') : void 0">NO COL</button></div></div>
+    <div class="fr"><button class="b on" id="bch" onclick="window.tog ? window.tog('ch') : void 0">CHEM</button><button class="b" id="bsw" onclick="window.tog ? window.tog('sw') : void 0">ECHO</button><button class="b" id="blt" onclick="window.tog ? window.tog('lt') : void 0">LIGHT</button><button class="b" id="bcol" onclick="window.tog ? window.tog('col') : void 0">COLLIDERS</button><button class="b on" id="bai" onclick="window.tog ? window.tog('ai') : void 0">AI CTRL</button><button class="b" id="bnoCol" onclick="window.tog ? window.tog('noCol') : void 0">NO COL</button><button class="b" id="bcpgWave" title="Handgeschriebene Gangkurve — standardmäßig AUS, nur zum A/B-Vergleich" onclick="window.tog ? window.tog('cpgWave') : void 0">CPG WAVE</button></div></div>
 </div>
 <button class="b a" id="pbk" onclick="window.exitPlay ? window.exitPlay() : void 0">← TRAINING</button>
 <div id="php"></div>

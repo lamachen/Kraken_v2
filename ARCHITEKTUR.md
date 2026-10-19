@@ -162,9 +162,11 @@ CHECKS: 12/12
 1. **Propriozeption** — pro Arm: Schulterwinkel, mittlere Krümmung, Spitzenposition
    relativ zum Rumpf (x/y), Kontakt. Dazu Rumpf-Beschleunigung. `NI` 64 → ~104.
    Ohne das kann die KI ihren Körper nicht verstehen.
-2. **Curriculum für Asymmetrie** — Phase 0 in einer Karte mit *einem* Ankerpunkt
-   starten, damit „einseitig ankern und ziehen" überhaupt selektierbar ist, dann
-   Komplexität steigern.
+2. ~~**Curriculum für Asymmetrie** — Phase 0 in einer Karte mit *einem*
+   Ankerpunkt starten.~~ **Gestrichen.** Das wäre genau das Falsche: dedizierte
+   Greifpunkte sind Casual-Game-Design. `OVR.floorGrip` haftet ohnehin überall
+   auf der Oberfläche, und gemessen braucht es keine Starthilfe — die Anker-Rate
+   liegt ab Generation 0 bei ~31 %.
 3. **Symmetrie brechen** — Arme paarweise koppeln (`k` und `k+3`) halbiert den
    Suchraum und erzwingt gegenläufige Bewegungsmuster.
 4. **CMA-ES statt `(μ,λ)`-GA** — bei 4027 Gewichten deutlich schnellere Konvergenz.
@@ -248,7 +250,8 @@ und wurde außerdem nirgends benutzt — gebaut wurde `new SuctionCup(CONN_SEGS-
 also ein einziger Napf ganz außen. Der ursprüngliche Code-Kommentar („Suction
 cups at tip, 57%, 28% of tentacle length") beschreibt bereits die Absicht.
 
-Jetzt `SUCTION_IDX = [2, 4, CONN_SEGS-1]` → **18 Ankerpunkte** pro Krake.
+Jetzt `SUCTION_IDX = [2, 4, CONN_SEGS-1]` → **18 Saugnäpfe** pro Krake
+(an ihren eigenen Armen — keine Greifpunkte in der Karte, siehe unten).
 Zusammen mit `floorGrip` kann die KI damit mehrarmig koordiniert ziehen statt
 nur an einer einzigen Spitze. Gemessen: bis zu **5 Arme gleichzeitig verankert**.
 
@@ -300,3 +303,75 @@ und +0.03 px Netto/Gen. Die Propriozeption ist also nicht Kosmetik, sondern der
 Hebel, der den Gradienten überhaupt erst trägt.
 
 `npm ci && npm run build` → exit 0, TypeScript sauber, `eslint` leer.
+
+
+---
+
+# Runde 3 — Scripting raus
+
+Zwei Dinge waren noch handgeschrieben und sind es nicht mehr. Beides war
+Designverfehlung, nicht Kalibrierung.
+
+## 1. Die CPG-Welle war eine vorgegebene Gangkurve
+
+`waveAt()` erzeugte einen Sinus, über `PULL_ASYM = 1.8` geformt zu „langsam
+strecken, schnell ziehen", mit festen Phasenversätzen `k·2π/6` über die sechs
+Arme. Das Netz durfte nur die Amplitude skalieren — **der Rhythmus selbst war
+vorgeschrieben.**
+
+Jetzt ist `OVR.cpgWave` standardmäßig **aus**. Der Zielwinkel jedes Gelenks kommt
+ausschließlich aus `ctrl.curl + ctrl.waveDirect`, zwei direkten NN-Ausgängen pro
+Arm (`waveDirect` übernimmt `out[2+k*4+1]`, damit kein Ausgang tot ist). Den
+Rhythmus muss das Netz selbst erzeugen — über die 27 rekurrenten Eingänge
+(`prevOut`) hat es dafür ein Gedächtnis. Übrig bleibt auf `[27]/[28]` eine
+Phasenuhr als Zeitreferenz. Eine Uhr ist keine Gangart.
+
+Der Schalter bleibt als `CPG WAVE`-Button im UI, aber **nur zum A/B-Messen**.
+
+### A/B-Messung (je 16 Generationen à 900 Schritte, Phase 0)
+
+| | **CPG aus** (Default) | CPG an |
+|---|---|---|
+| Regression-Checks | **13/13** | 12/13 |
+| Trend Score/Generation | **+36.99** | +19.69 |
+| Trend Vorwärts-Projektion/Gen | +18.66 px | +22.87 px |
+| Trend **Netto-Distanz**/Gen | **+7.39 px** | **−9.34 px** |
+| Score Ø erste → letzte 5 Gen | 1993 → **2431** | 2374 → 2588 |
+| Grip-Kriechstrecke | 1097 → **1331 px** | 1254 → 1422 px |
+| Anker-Rate | 31 → **34 %** | 34 → 30 % |
+| Grip-Pull-Vortrieb (Test) | **105 px** | 34 px |
+| steps/s | 105 | 106 |
+
+**Die vorgegebene Gangkurve hat echten Netto-Fortschritt verhindert** — ihr
+Trend auf die Netto-Distanz ist negativ. Sie war eine Krücke aus der Phase, in
+der die KI noch blind für die eigene Armpose war. Mit Propriozeption ist sie
+nicht nur unnötig, sie steht im Weg.
+
+## 2. `GRIP_MAX_TIME` war ein Timer, kein Physik
+
+Ein Saugnapf, der nach 3.0 Sekunden von selbst loslässt, ist physikalischer
+Unsinn und reines Scripting. `GRIP_MAX_TIME = 0` (deaktiviert). Ein Anker hält
+jetzt, bis er
+
+- **mechanisch abreißt** — `GRIP_BREAK = 22 px` Dehnung, oder
+- **die KI ihn selbst löst** — `SUCK_OFF = −0.15` über die Hysterese.
+
+`gTime` bleibt als Sensorwert erhalten, falls das Netz ihn nutzen will.
+
+## Was in der Karte ist — und was nicht
+
+`GameMap.build()` erzeugt genau zwei Sorten Geometrie:
+
+1. die vier Randwände,
+2. den zufälligen Korridorraster (`COLS=4`, `ROWS=3`, ~48 % Belegung pro Zelle).
+
+**Es gibt keine dedizierten Greifpunkte, keine Noppen, keine markierten Stellen,
+keinen Grapple-Hook-Raster.** `OVR.floorGrip = true` heißt: der Saugnapf haftet
+überall dort, wo er hinreicht — die Oberfläche selbst ist der Halt. Damit ist
+Greifen eine Eigenschaft des Körpers und der Geometrie, nicht ein Spielelement.
+
+> Ein zwischenzeitlicher Zweig hatte ein Raster aus Anker-Noppen (130 px Abstand,
+> ~37 pro Karte) eingeführt, um „nichts Erreichbares" zu lösen. Das war die
+> falsche Diagnose — das echte Problem war `floorGrip` noch nicht zu kennen plus
+> der klemmende Saugnapf-Cooldown. Dieser Zweig wurde verworfen und ist **nie
+> gepusht** worden. `grep GRIP_SPACING\|gripPoints\|isNub public/sim.js` → leer.
