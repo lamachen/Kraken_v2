@@ -375,3 +375,114 @@ Greifen eine Eigenschaft des Körpers und der Geometrie, nicht ein Spielelement.
 > falsche Diagnose — das echte Problem war `floorGrip` noch nicht zu kennen plus
 > der klemmende Saugnapf-Cooldown. Dieser Zweig wurde verworfen und ist **nie
 > gepusht** worden. `grep GRIP_SPACING\|gripPoints\|isNub public/sim.js` → leer.
+
+---
+
+# Runde 4 — 1 Napf pro Arm, und Haftung als Reflex statt als Schalter
+
+## 1. Zurück auf einen Saugnapf pro Arm
+
+`SUCTION_IDX = [CONN_SEGS-1]` — ein Napf an der greifenden Spitze, 6 pro Krake.
+
+Drei Näpfe pro Arm (18 Anker) waren zu viel Körperebene auf einmal: bei
+expliziter An/Aus-Steuerung wären das 18 Kanäle, die das Netz *zeitlich treffen*
+müsste, und selbst bei reflexiver Haftung verschiebt es die Körperform von „die
+Spitze greift" zu „der ganze Arm klebt". (Der ursprüngliche Wert `[CONN_SEGS]`
+= `[7]` lag außerhalb des Segmente-Arrays und wurde nirgends benutzt — jetzt ist
+der Index korrekt abgeleitet.)
+
+## 2. Die An/Aus-Frage — beantwortet durch Messung, nicht durch Geschmack
+
+**Ausgangspunkt war deine Gegenfrage:** Kann die Bewegung funktionieren, wenn die
+KI An/Aus *nicht* steuert — und wird sie dann nicht mitten im Sprint vom eigenen
+Arm verankert, weil ein Timer 3 s braucht?
+
+Beide Hörner der Zange fallen weg, wenn man Haftung als **lokalen physikalischen
+Reflex** modelliert und der KI statt eines Schalters eine **stetige Haftstärke**
+`a ∈ [0,1]` gibt:
+
+```
+Anhaften (Reflex, keine NN-Entscheidung, kein Timing):
+    Spitze hat Kontakt  UND  Slip < GRIP_SLIP_MAX (2.5 px/step)  UND  a > 0.08
+
+Lösen:
+    mechanisch, wenn Dehnung > breakLen = 3.0 + 19·a²      ← begrenzte Haltekraft
+    willentlich, wenn die KI a unter 0.04 zurücknimmt
+    NIEMALS durch einen Timer                                ← GRIP_MAX_TIME = 0
+```
+
+**Warum das dein Sprint-Szenario konstruktiv ausschließt:**
+
+1. Beim Sprint ist die Spitzengeschwindigkeit hoch (eine Spitze auf Radius 100 px
+   bewegt sich bei `MAX_ANG_V 0.30` mit bis zu 30 px/step) → weit über dem
+   Slip-Gate von 2.5 → **es haftet gar nichts an.**
+2. Selbst wenn ein Napf sitzt: die Reißgrenze skaliert quadratisch mit `a`.
+   Bei einem neutralen Genom ist `a ≈ 0.25` → `breakLen ≈ 4.2 px`. Die
+   Zugspannung des Sprints reißt diese Bindung **im selben Frame**.
+3. Es gibt keinen Timer mehr, der nachlaufen könnte.
+
+Die KI muss also keinen *Zeitpunkt* treffen — das war das eigentliche
+Lernhindernis — sondern nur einen *Zustand* wählen: wie klebrig soll dieser Arm
+gerade sein. Zustände sind stetig, Zeitpunkte nicht.
+
+**Und das ist genau deine begrenzte Haltekraft:** `GRIP_BREAK = 22 px` bei voll
+gestellter Haftung, `GRIP_BREAK_MIN = 3 px` bei keiner. Zerrt eine Kraft den
+Körper in eine andere Richtung, steigt die Dehnung, und die schwächste Bindung
+reißt. Nicht gescriptet — es ist die Constraint-Dehnung, die Matter ohnehin
+berechnet.
+
+## 3. Warum der Slip-Gate den Takt von selbst erzeugt
+
+Das ist der Teil, der den „Angler-Fisch"-Gang überflüssig macht. Der Untergrund
+ist statisch, also ist Slip = Spitzengeschwindigkeit. Daraus folgt ohne jede
+Vorgabe:
+
+- ein **schwingender** Arm gleitet → haftet nicht
+- ein **gesetzter** Arm steht → haftet
+
+*Setzen und Schwingen* ist damit keine Entscheidung, die das Netz timen muss,
+sondern eine physikalische Konsequenz davon, wo die Spitze gerade ist. Dein
+Wunschbild „alle Arme im intelligenten Zusammenspiel, beim Sprint mehrere in
+gleichmäßiger Folge nach vorne greifend, sodass immer mindestens einer zieht" ist
+genau das Muster, das aus dieser Regel *emergieren* kann — statt dass ein
+Angler-Gang von außen aufoktroyiert wird.
+
+Und dein Punkt „im Raum stehend in jede Richtung ziehen, bis die
+gegenüberliegenden Arme gestreckt sind": bei reflexiver Haftung und `floorGrip`
+ist das keine gelernte Fähigkeit, sondern **Geometrie**. Es ergibt sich von selbst.
+
+## 4. Der Deadlock, den die erste Fassung hatte
+
+Erste Implementierung: `a = 0.5 + 0.5·suckRaw`. Ein Zufallsgenom ist damit im
+Schnitt `a ≈ 0.5` → halb klebrig → bei `floorGrip` klebten alle 6 Arme am Boden.
+Gemessen: **90 % der Zeit verankert, bis 6 Arme gleichzeitig, Netto-Trend −3.82
+px/Generation.** Die Krake war festgeleimt.
+
+Fix: Nullpunkt bei `suckRaw = 0` auf `a = 0` („nicht klebrig"), und die Reißgrenze
+quadratisch statt linear in `a`. Kleben ist damit eine *Entscheidung*, die die
+Evolution treffen muss — nicht der Default, aus dem sie nicht herausfindet.
+
+## 5. A/B-Messung (je 14 Generationen à 900 Schritte, Phase 0)
+
+| | **reflexiv** (Default) | explizit An/Aus |
+|---|---|---|
+| Regression-Checks | **13/13** | 12/13 |
+| Trend Score/Generation | **+50.83** | +30.54 |
+| Trend Vorwärts/Generation | **+16.03 px** | +12.34 px |
+| Trend **Netto-Distanz**/Generation | **+5.14 px** | +1.06 px |
+| Score Ø erste → letzte 4 Gen | 1140 → 1638 (**+44 %**) | 2508 → 2858 (+14 %) |
+| Grip-Kriechstrecke | 443 → 741 px (**+67 %**) | 1325 → 1536 px (+16 %) |
+| Anker-Rate | 8 → 11 % | 23 → 37 % |
+| Zwangs-Gang-Vortrieb | **249 px** | −61 px |
+| steps/s | 111 | 101 |
+
+**Ehrliche Einordnung:** reflexiv hat den deutlich steileren Lerngradienten,
+liegt aber im *absoluten* Score noch zurück (1638 vs. 2858). Das ist ein
+Startpunkt-Effekt: ein Zufallsgenom ist jetzt nicht-klebrig und kommt anfangs
+kaum voran, dafür verbessert es sich pro Generation fünfmal so schnell. Die
+niedrige Anker-Rate (11 % vs. 37 %) heißt, dass die KI „klebrig sein lohnt sich"
+noch nicht vollständig entdeckt hat — bei der im Spiel tatsächlich eingestellten
+Episodenlänge (x
+Generationen pro Phase hat sie dafür etwa 8× mehr Budget als in dieser Messung.
+
+Der Schalter `REFLEX GRIP` bleibt im UI, damit du selbst A/B fahren kannst.

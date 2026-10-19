@@ -120,9 +120,27 @@ const SHOULDER_LIMIT=Math.PI*0.62;
 const TONE_MIN   = 0.30;     // out[1] = Muskeltonus: 0.30 = schlaff, 1.0 = steif
 const CPG_HZ_MIN = 0.35;     // out[0] = Wellenfrequenz der metachronalen Welle
 const CPG_HZ_MAX = 1.70;     //   (in Vielfachen von CPG_BASE_HZ)
-const SUCK_ON    = 0.15;     // ab hier haftet der Saugnapf an
+const SUCK_ON    = 0.15;     // ab hier haftet der Saugnapf an   (Modus: explizit)
 const SUCK_OFF   = -0.15;    // erst hierunter lässt er wieder los (Hysterese)
-const GRIP_BREAK = 22;       // px — ab welcher Dehnung ein Saugnapf abreißt
+const GRIP_BREAK = 22;       // px — Dehnung, bei der VOLL gestellte Haftung reißt
+
+// ── REFLEXIVE ADHÄSION (OVR.reflexGrip) ──────────────────────────
+// Das Netz steuert hier kein "an/aus", sondern eine stetige HAFTSTÄRKE a∈[0,1].
+// Anhaften ist ein lokaler physikalischer Reflex, Lösen passiert mechanisch.
+const GRIP_SLIP_MAX  = 2.5;  // px/step — bis dahin STEHT die Spitze relativ zum
+                             // Untergrund und kann fassen. Das ist der eigentliche
+                             // Taktgeber: ein schwingender Arm gleitet durch, ein
+                             // gesetzter Arm haftet — ohne dass die KI einen
+                             // Einschalt-Zeitpunkt treffen müsste.
+                             // 1.1 war zu eng: eine Spitze auf Radius 100 px bewegt
+                             // sich bei MAX_ANG_V 0.30 mit bis zu 30 px/step, das
+                             // Haftfenster lag also nur am äußersten Umkehrpunkt.
+const GRIP_ATTACH_MIN= 0.08; // a ab dem überhaupt angesaugt wird
+const GRIP_DETACH    = 0.04; // a unter dem die KI den Napf willentlich löst
+const GRIP_BREAK_MIN = 3.0;  // px — Reißgrenze bei a=0 (kaum Haftung)
+                             // breakLen = GRIP_BREAK_MIN + (GRIP_BREAK-GRIP_BREAK_MIN)·a
+                             // → eine schwach gestellte Bindung reißt sofort, sobald
+                             //   der Körper in eine andere Richtung zieht.
 const GRIP_MAX_TIME = 0;     // 0 = deaktiviert. Ein Saugnapf hat keinen Timer —
                              // automatisches Loslassen nach 3 s war reines Scripting
                              // und physikalisch unsinnig. Ein Anker hält jetzt, bis er
@@ -135,12 +153,15 @@ const PULL_ASYM=1.8;         // >1 = langsam strecken, schnell ziehen.
                              // soweit zurück wie sie holt — der Gang braucht diese
                              // Asymmetrie, damit überhaupt Netto-Vortrieb entsteht.
 const DEBRIS=[];             // war undefiniert → latenter Crash in _damTent/takeDamage
-// Saugnäpfe sitzen bei echten Cephalopoden auf der GANZEN Arm-Unterseite.
-// Der alte Wert [CONN_SEGS] = [7] lag außerhalb des Segmente-Arrays (0..6) und
-// wurde außerdem gar nicht benutzt — es gab einen einzigen Napf ganz außen.
-// Drei Näpfe pro Arm = 18 Ankerpunkte: zusammen mit OVR.floorGrip kann die KI
-// damit auch mehrarmig koordiniert ziehen, nicht nur mit einer einzigen Spitze.
-const SUCTION_IDX = [2, 4, CONN_SEGS-1];
+// EIN Saugnapf pro Arm, an der greifenden Spitze.
+// Drei Näpfe pro Arm (18 Anker pro Krake) waren zu viel Körperebene auf einmal:
+// bei expliziter An/Aus-Steuerung wären das 18 Kanäle, die das Netz zeitlich
+// treffen müsste, und selbst bei reflexiver Haftung verschiebt es die Körperform
+// von "die Spitze greift" zu "der ganze Arm klebt".
+// Historisch: der ursprüngliche Wert [CONN_SEGS] = [7] lag AUSSERHALB des
+// Segmente-Arrays (0..6) und wurde nirgends benutzt — gebaut wurde
+// `new SuctionCup(CONN_SEGS-1)`. Jetzt ist der Index korrekt abgeleitet.
+const SUCTION_IDX = [CONN_SEGS-1];
 // NI 64 → 104: 40 neue Eingänge sind PROPRIOZEPTION.
 // Bisher standen Echolot, Chemie, Licht, Grip-Status, Tempo und Wandnähe drin —
 // aber kein einziger Gelenkwinkel. Die KI war blind für die Pose ihrer eigenen
@@ -672,9 +693,11 @@ class Auditarcle{
 
 // ─── SUCTION CUP ──────────────────────────────────────────
 class SuctionCup{
-  constructor(si){this.si=si;this.active=false;this.gripped=false;this.gx=0;this.gy=0;this.gTarget=null;this.gTime=0;this.constraint=null;this.load=0;this.cd=0;}
-  tryGrip(pt,map,preys){
+  constructor(si){this.si=si;this.active=false;this.gripped=false;this.gx=0;this.gy=0;this.gTarget=null;this.gTime=0;this.constraint=null;this.load=0;this.slip=0;this.adhesion=0;this.cd=0;}
+  tryGrip(pt,map,preys,adhesion){
     if(this.gripped)return;
+    const a=clamp(adhesion===undefined?1:adhesion,0,1);
+    this.adhesion=a;
     // BUG (war auch in ee24fb5 noch drin): `cd` wurde ausschließlich in
     // applyConstraint() dekrementiert — und das läuft nur, solange `gripped`.
     // Ein einziger Fehlversuch (z. B. Spitze zu schnell) setzte cd=0.05 und der
@@ -687,11 +710,19 @@ class SuctionCup{
     const tx = pt.x + Math.cos(angle) * tipLen;
     const ty = pt.y + Math.sin(angle) * tipLen;
 
-    // Ein Saugnapf kann nicht an einer rasenden Spitze haften. Der Wert ist kein
-    // Flaschenhals (gemessen: Anker-Rate identisch für Gate 2.4 / 5 / 12 / 50 / ∞,
-    // weil abreißende Anker über GRIP_BREAK limitieren, nicht über das Gate) —
-    // 6.0 lässt der KI aber die Freiheit, im Gleiten anzusetzen.
-    if(Vector.magnitude(pt.body.velocity) > 6.0) { this.cd=0.05; return; }
+    const slip=Vector.magnitude(pt.body.velocity);
+    this.slip=slip;
+    if(OVR.reflexGrip){
+      // REFLEX: Haftung braucht (1) den Willen der KI (a) und (2) eine Spitze,
+      // die relativ zum Untergrund STEHT. Der Slip-Gate ist der Taktgeber des
+      // Gangs — ein schwingender Arm gleitet durch, ein gesetzter fasst.
+      // Die KI muss keinen Einschalt-Zeitpunkt treffen, nur "klebrig" sein.
+      if(a < GRIP_ATTACH_MIN) { this.cd=0.04; return; }
+      if(slip > GRIP_SLIP_MAX){ this.cd=0.03; return; }
+    }else{
+      // EXPLIZIT: die KI schaltet binär, Tempo nur als Plausibilitätsgrenze
+      if(slip > 6.0) { this.cd=0.05; return; }
+    }
 
     let target = null;
     // Beute hat Vorrang (beweglicher Greifling)
@@ -743,18 +774,31 @@ class SuctionCup{
     if(this.constraint) World.remove(world, this.constraint);
     this.constraint=null; this.gripped=false; this.gTarget=null; this.gTime=0; this.load=0; this.cd=0.12;
   }
-  applyConstraint(pt,orgMass){
+  applyConstraint(pt,orgMass,adhesion){
     if(!this.gripped)return false;
     this.gTime += DT;
     if(this.cd>0)this.cd-=DT;
+    if(adhesion!==undefined) this.adhesion=clamp(adhesion,0,1);
+    const a=this.adhesion;
     if(GRIP_MAX_TIME > 0 && this.gTime > GRIP_MAX_TIME) { this.release(); return false; }
     // Breaking force check from TIP position
     const tipLen = CONN_SL / 2;
     const tpos = { x: pt.x + Math.cos(pt.body.angle)*tipLen, y: pt.y + Math.sin(pt.body.angle)*tipLen };
     const anchor = this.gTarget ? this.gTarget.body.position : this.constraint.pointB;
     const bl = anchor ? Vector.magnitude(Vector.sub(tpos, anchor)) : 999;
-    this.load = clamp(bl/GRIP_BREAK,0,1);   // 0 = entspannt, 1 = kurz vor dem Abriss
-    if(bl > GRIP_BREAK) { this.release(); return false; }
+    // BEGRENZTE HALTEKRAFT: die Reißgrenze skaliert mit der Haftstärke, die die
+    // KI gewählt hat. Zerrt der Körper in eine andere Richtung, steigt die
+    // Dehnung — und eine schwach gestellte Bindung reißt im selben Frame.
+    // Das ist der Mechanismus, der "vom eigenen Arm verankert werden" unmöglich
+    // macht, ohne dass die KI einen Ausschalt-Zeitpunkt treffen muss.
+    // Quadratisch in a: eine halb gestellte Bindung ist deutlich schwächer als
+    // eine voll gestellte. Dadurch kommt der Körper aus einem versehentlichen
+    // Mehrfach-Anker immer noch heraus, während ein bewusst gesetzter Anker hält.
+    const breakLen = OVR.reflexGrip ? (GRIP_BREAK_MIN + (GRIP_BREAK-GRIP_BREAK_MIN)*a*a) : GRIP_BREAK;
+    this.load = clamp(bl/breakLen,0,1);   // 0 = entspannt, 1 = kurz vor dem Abriss
+    if(bl > breakLen) { this.release(); return false; }
+    // willentliches Lösen: die KI nimmt die Haftung zurück
+    if(OVR.reflexGrip && a < GRIP_DETACH) { this.release(); return false; }
     return true;
   }
   draw(pt,col,suctionOn){
@@ -834,6 +878,7 @@ class Connectarcle{
     this.nnAng=[0,0,0];this.worldRestAng=relAng;this.col='#00ffb3';
     this.cups=SUCTION_IDX.map(idx=>new SuctionCup(idx));
     this.suctionOn=false;
+    this.adhesion=0;   // 0..1 — stetige Haftstärke (reflexiver Modus)
     this.suckLatch=false;   // Hysterese-Zustand des Saugnapfs
     this.constraints=[];
 
@@ -1027,10 +1072,11 @@ class Connectarcle{
     for(let ci=0;ci<this.cups.length;ci++){
       const cup=this.cups[ci];
       const si=Math.min(cup.si,n-1);const pt=this.pts[si];
-      if(this.suctionOn&&!cup.gripped)cup.tryGrip(pt,map,preys);
-      else if(!this.suctionOn&&cup.gripped)cup.release();
+      const adh = OVR.reflexGrip ? this.adhesion : (this.suctionOn?1:0);
+      if(adh>GRIP_ATTACH_MIN && !cup.gripped) cup.tryGrip(pt,map,preys,adh);
+      else if(adh<=GRIP_ATTACH_MIN && cup.gripped && !OVR.reflexGrip) cup.release();
       if(cup.gripped){
-        const held=cup.applyConstraint(pt,orgMass);
+        const held=cup.applyConstraint(pt,orgMass,adh);
         this.gripLoad=cup.load||0;
         if(!held)this.gripLoad=0;
       }else this.gripLoad*=0.8;
@@ -1406,6 +1452,18 @@ class Organism{
       // Echte Saugnäpfe haften passiv: Anhaften ist eine Entscheidung, Halten
       // kostet fast nichts, und gelöst wird erst durch bewusste Entspannung.
       const suckRaw = out[2+k*4+3]||0;
+      // out[2+k*4+3] ist im reflexiven Modus eine STETIGE Haftstärke a in [0,1]
+      // statt eines binären Schalters. Die KI entscheidet nicht WANN, sondern
+      // WIE FEST — den Zeitpunkt setzt die Physik über den Slip-Gate.
+      // (eMult wird weiter unten berechnet, deshalb hier noch ohne; die
+      //  Energieminderung folgt direkt nach setTorques.)
+      // Nullpunkt bei suckRaw=0 muss "nicht klebrig" sein (a=0), NICHT "halb".
+      // Mit 0.5+0.5*suckRaw war ein Zufallsgenom im Schnitt a≈0.5 → bei
+      // floorGrip klebten alle 6 Arme am Boden und der Körper war festgeleimt
+      // (gemessen: 90 % verankert, 6 Arme gleichzeitig, Netto-Trend NEGATIV).
+      // Evolution braucht einen Startzustand, aus dem heraus Kleben eine
+      // ENTSCHEIDUNG ist, nicht der Default.
+      c.adhesion = clamp(suckRaw, 0, 1);
       if (suckRaw >  SUCK_ON)  c.suckLatch = true;
       else if (suckRaw < SUCK_OFF) c.suckLatch = false;
       let suctionOn = !!c.suckLatch;
@@ -1422,6 +1480,7 @@ class Organism{
       this.energy -= eCost;
 
       c.setTorques(oShoulder*eMult, oWave*eMult, oCurl*eMult);   // (Legacy, wird noch gelesen)
+      c.adhesion *= eMult;   // erschöpft -> Haftung lässt nach, wie ein echter Muskel
       c.setControl(
         clamp(oShoulder*eMult,-1,1)*SHOULDER_LIMIT,
         clamp(oCurl*eMult,-1,1)*JOINT_LIMIT*0.8,
@@ -1846,7 +1905,7 @@ let paused=false,speed=1,autoEvo=true,popSz=MOB?6:8,mapRegenInterval=5;
 // cpgWave = false ist DEFAULT und bleibt es: keine handgeschriebene Gangkurve.
 // Der Schalter existiert nur, um den Unterschied messbar zu machen (A/B), nicht
 // weil das Spiel ihn braucht.
-const OVR={ch:true,sw:false,lt:false,col:false,ai:true,noCol:false,floorGrip:true,cpgWave:false};
+const OVR={ch:true,sw:false,lt:false,col:false,ai:true,noCol:false,floorGrip:true,cpgWave:false,reflexGrip:true};
 let _spsAcc=0,_spsT=0,_sps=0;
 
 function setMode(m){
