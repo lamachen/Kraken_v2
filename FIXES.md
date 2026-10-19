@@ -2,6 +2,17 @@
 
 Stand: 2026-10-19 · Zweig `fix/physics-locomotion`
 
+> ⚠️ **Dieses Dokument beschreibt die erste Reparaturrunde.** Der hier als Verbesserung
+> eingeführte **Jet-Antrieb ist wieder entfernt** — er war ein Designfehler: das Projekt
+> spielt nicht unter Wasser, und es darf grundsätzlich keine Kraft von außen auf den
+> Körper wirken. Das tatsächlich gewollte Körpermodell (Oberfläche, keine Flüssigkeit,
+> Fortbewegung ausschließlich über Gelenkmomente + Saugnapf-Verankerung) steht in
+> **[`ARCHITEKTUR.md`](ARCHITEKTUR.md)**.
+>
+> Alle übrigen Befunde in diesem Dokument — `angularStiffness`, Kapsel-Geometrie,
+> `angDiff`, Doppel-Boot, Constraint-Synchronisation, Fitness-Reward-Hacking —
+> bleiben gültig und sind weiterhin gefixt.
+
 ## Symptom (gemeldet)
 
 > „Aktuell kreiseln die Kraken alle nur im Kreis nach dem Start, und kurz vorher

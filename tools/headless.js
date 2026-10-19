@@ -144,7 +144,7 @@ if (tailIdx < 0) { console.error('IIFE tail not found in ' + SIM_PATH); process.
 simSrc = simSrc.slice(0, tailIdx) +
   'window.__dbg = () => ({ evlv, playS, MAP, CHEM, WAVES, world, engine, OVR, simMode, Composite, Body, Vector, DT, PHASES, CONN_SEGS, CONN_SL, N_CONN, popSz,' +
   ' Matter: (typeof Matter!=="undefined"?Matter:(window.__MTR__||null)), SUBSTEPS: (typeof SUBSTEPS!=="undefined"?SUBSTEPS:1), MAX_LIN_V: (typeof MAX_LIN_V!=="undefined"?MAX_LIN_V:11),' +
-  ' MAX_ANG_V: (typeof MAX_ANG_V!=="undefined"?MAX_ANG_V:0.3), JET_MAX: (typeof JET_MAX!=="undefined"?JET_MAX:0), MUSCLE_TMAX: (typeof MUSCLE_TMAX!=="undefined"?MUSCLE_TMAX:0) });\n' +
+  ' MAX_ANG_V: (typeof MAX_ANG_V!=="undefined"?MAX_ANG_V:0.3), MUSCLE_TMAX: (typeof MUSCLE_TMAX!=="undefined"?MUSCLE_TMAX:0), OVR: OVR, GRIP_BREAK: (typeof GRIP_BREAK!=="undefined"?GRIP_BREAK:0) });\n' +
   tail;
 
 // silence the sim's own chatter unless asked for
@@ -291,8 +291,7 @@ bar('TEST 2 — MATTER-WORLD LEAK bei wiederholtem MAP.build()');
 // ── helper: measure one organism ──────────────────────────────
 function measureOrganism(o, steps, sharedTick) {
   const sx = o.x, sy = o.y;
-  let path = 0, px = o.x, py = o.y, angAcc = 0, fwd = 0, gripTicks = 0, spinGrip = 0, jetFirings = 0;
-  let prevJet = 0;
+  let path = 0, px = o.x, py = o.y, angAcc = 0, fwd = 0, gripTicks = 0, spinGrip = 0, anchorSteps = 0;
   const nets = [];
   for (let i = 0; i < steps; i++) {
     const ax = o.x, ay = o.y;
@@ -305,14 +304,13 @@ function measureOrganism(o, steps, sharedTick) {
     if (proj > 0) fwd += proj;
     const gripped = o.conns.some(c => c.alive && c.cups.some(s => s.gripped));
     if (gripped) { gripTicks++; if (Math.abs(o.av) > 0.04) spinGrip++; }
-    if ((o.jetCharge || 0) < prevJet - 0.5) jetFirings++;
-    prevJet = o.jetCharge || 0;
+    if (o.grippedNow > 0) anchorSteps++;
     if (i % 25 === 24) nets.push(Math.hypot(o.x - sx, o.y - sy));
     px = o.x; py = o.y;
   }
   const disp = Math.hypot(o.x - sx, o.y - sy);
   return {
-    disp, path, angAcc, rotations: angAcc / (Math.PI * 2), gripTicks, spinGrip, jetFirings,
+    disp, path, angAcc, rotations: angAcc / (Math.PI * 2), gripTicks, spinGrip, anchorPct: anchorSteps / steps,
     straightness: path > 1 ? disp / path : 0,
     forwardProg: o.forwardProg || 0,
     maxDisp: o.maxDisplacement || 0,
@@ -330,7 +328,7 @@ function measureOrganismStatic(o, steps) {
   const path = o.pathLen || 0;
   return {
     disp, path, angAcc: o.angularAccum || 0, rotations: (o.angularAccum || 0) / (Math.PI * 2),
-    gripTicks: o.gripCount || 0, spinGrip: 0, jetFirings: Math.round(o.jetImpulse ? o.jetImpulse * 3 : 0),
+    gripTicks: o.gripCount || 0, spinGrip: 0, anchorPct: 0,
     straightness: path > 1 ? disp / path : 0,
     forwardProg: o.forwardProg || 0, maxDisp: disp, gripPullProg: o.gripPullProg || 0,
     energySpent: o.energySpent || 0, wallHits: o.wallHits || 0, score: o.score(0), meanNet: disp,
@@ -361,7 +359,7 @@ dbg.evlv.setPhase(0);
       '  Umdreh.=' + fmt(m.rotations, 1).padStart(6) +
       '  Gerade=' + fmt(m.straightness * 100, 0).padStart(4) + '%' +
       '  Grip-Kriech=' + fmt(m.gripPullProg, 0).padStart(6) +
-      '  Jet=' + String(m.jetFirings).padStart(3) +
+      '  Anker=' + (m.anchorPct * 100).toFixed(0).padStart(3) + '%' +
       '  Wand=' + String(m.wallHits).padStart(3));
   }
   results.genLog = genLog;
@@ -397,38 +395,103 @@ dbg.evlv.setPhase(0);
   log(results.spinOK ? '  ✅ Kein dominantes Kreiseln mehr.' : '  ❌ Kreiseln dominiert weiterhin.');
 }
 
-// ── TEST 4: propulsion ───────────────────────────────────────
-bar('TEST 4 — JET-ANTRIEB (Verdrahtung + Physik)');
+// ── TEST 4: GRIP-AND-PULL ────────────────────────────────────
+bar('TEST 4 — GRIP-AND-PULL: zieht "ankern + Arm einknicken" den Rumpf?');
 {
-  const src = fs.readFileSync(SIM_PATH, 'utf8');
-  // (a) Verdrahtung: out[0]/out[1] müssen den Jet steuern
-  results.jetWired = /jetCmd\s*=\s*out\[0\]/.test(src) && /jetAim\s*=\s*[^;]*out\[1\]/.test(src);
-  log('  (a) out[0]/out[1] → Jet verdrahtet: ' + (results.jetWired ? '✅' : '❌'));
-
-  // (b) Physik: erzeugt ein Mantel-Stoß gerichtete Bewegung?
-  dbg.evlv._ng();
-  const o = dbg.evlv.orgs[0];
-  for (const c of o.conns) { c.suctionOn = false; for (const s of c.cups) s.release(); }
-  const sx = o.x, sy = o.y;
-  let path = 0, px = o.x, py = o.y, pulses = 0;
-  for (let i = 0; i < 300; i++) {
-    rawStep();
-    for (const c of o.conns) { c.suctionOn = false; for (const s of c.cups) if (s.gripped) s.release(); }
-    if (i % 25 === 0) {   // Puls alle ~0.42 s wie JET_REFRACT
-      const a = o.faceAng, F = dbg.JET_MAX * (dbg.SUBSTEPS || 1);
-      dbg.Body.applyForce(o.pt.body, o.pt.body.position, { x: Math.cos(a) * F, y: Math.sin(a) * F });
-      pulses++;
+  // Physik-Validierung mit einem GESCRIPTETEN Inchworm-Controller.
+  // Das ist absichtlich nicht die KI — es prüft nur, ob der Körper den
+  // Mechanismus physikalisch hergibt. Wenn nein, kann ihn keine Evolution lernen.
+  //
+  // Wichtig: 6 radial symmetrische Arme, die alle gleichzeitig ankern und
+  // einknicken, heben sich gegenseitig auf. Fortbewegung erfordert ASYMMETRIE —
+  // Arme auf einer Seite verankern und heranziehen. Genau das wird hier getestet.
+  const resultsT4 = [];
+  for (const dirDeg of [0, 90, 180]) {
+    const dir = dirDeg * Math.PI / 180;
+    dbg.evlv._ng();
+    const o = dbg.evlv.orgs[0];
+    const sx = o.x, sy = o.y;
+    // nur Arme, die in ±70° um die Zielrichtung liegen, dürfen ankern
+    const pullers = o.conns.filter(c => {
+      const d = Math.abs(Math.atan2(Math.sin(c.relAng - dir), Math.cos(c.relAng - dir)));
+      return d < 1.22;
+    });
+    const origTick = o.tick.bind(o);
+    // suctionOn MUSS vor Connectarcle.tick() gesetzt werden — origTick() leitet es
+    // aus dem NN ab und ruft danach c.tick(), das bei suctionOn=false sofort löst.
+    const forceSuction = new Map();
+    for (const c of o.conns) {
+      const oc = c.tick.bind(c);
+      c.tick = function (map, preys, om, bx, by) {
+        if (forceSuction.has(c)) { c.suctionOn = forceSuction.get(c); c.suckLatch = c.suctionOn; }
+        oc(map, preys, om, bx, by);
+      };
     }
-    const d = Math.hypot(o.x - px, o.y - py); path += d; px = o.x; py = o.y;
+    let phase = 0, cycle = 0;
+    // 3-Phasen-Inchworm: (1) langsam ausstrecken + Anker setzen,
+    // (2) Anker HALTEN und einknicken → Rumpf wird herangezogen,
+    // (3) lösen und nachziehen. Saugnäpfe dürfen in Phase 2 NICHT ausgehen,
+    // sonst lässt der Arm genau dann los, wenn er ziehen soll.
+    const P1 = 34, P2 = 34, P3 = 16, CYCLE = P1 + P2 + P3;
+    o.tick = function (preys) {
+      origTick(preys);
+      o.energy = 1;
+      phase = (phase + 1) % CYCLE;
+      if (phase === 0) cycle++;
+      const t = phase / P1;
+      for (const c of o.conns) {
+        const isPuller = pullers.indexOf(c) >= 0;
+        if (!isPuller) {                       // Nicht-Zieher: wegklappen, nie ankern
+          c.ctrl.shoulder = 0.75; c.ctrl.curl = 0.35; c.ctrl.wave = 0;
+          forceSuction.set(c, false);
+          continue;
+        }
+        c.ctrl.wave = 0;
+        c.ctrl.shoulder = 0;
+        if (phase < P1) {                      // (1) ausstrecken, Saugnapf scharf
+          c.ctrl.curl = -0.55 + t * 0.55;      // langsam → Spitze bleibt unter 2.4 px/step
+          forceSuction.set(c, true);
+        } else if (phase < P1 + P2) {          // (2) HALTEN und einknicken
+          const u = (phase - P1) / P2;
+          c.ctrl.curl = u * 1.30;
+          forceSuction.set(c, true);           // ← Anker bleibt
+        } else {                               // (3) lösen, nachziehen
+          c.ctrl.curl = 1.30 - ((phase - P1 - P2) / P3) * 1.85;
+          forceSuction.set(c, false);
+        }
+      }
+    };
+    let path = 0, px = o.x, py = o.y, anchored = 0, maxGrip = 0;
+    const N = 84 * 10;   // 10 Inchworm-Zyklen
+    for (let i = 0; i < N; i++) {
+      const ax = o.x, ay = o.y;
+      rawStep();
+      path += Math.hypot(o.x - ax, o.y - ay); px = o.x; py = o.y;
+      const g = o.conns.reduce((a, c) => a + (c.cups.some(s => s.gripped) ? 1 : 0), 0);
+      if (g > 0) anchored++;
+      if (g > maxGrip) maxGrip = g;
+    }
+    const dx = o.x - sx, dy = o.y - sy;
+    const disp = Math.hypot(dx, dy);
+    const along = dx * Math.cos(dir) + dy * Math.sin(dir);   // Projektion auf Zielrichtung
+    resultsT4.push({ dirDeg, disp, along, path, anchoredPct: anchored / N, maxGrip });
+    log('  Zielrichtung ' + String(dirDeg).padStart(3) + '°  →  netto=' + disp.toFixed(0).padStart(5) + 'px' +
+      '  davon in Zielrichtung=' + along.toFixed(0).padStart(5) + 'px' +
+      '  pfad=' + path.toFixed(0).padStart(5) + 'px' +
+      '  gerichtet=' + (path > 1 ? (along / path * 100).toFixed(0) : '0').padStart(4) + '%' +
+      '  verankert=' + (anchored / N * 100).toFixed(0).padStart(4) + '% d.Zeit' +
+      '  maxArme=' + maxGrip);
   }
-  const disp = Math.hypot(o.x - sx, o.y - sy);
-  results.jetPath = path; results.jetDist = disp; results.jetDirected = path > 1 ? disp / path : 0;
-  results.jetOK = results.jetWired && path > 150 && results.jetDirected > 0.35;
-  log('  (b) ' + pulses + ' Mantel-Stöße → Pfad ' + fmt(path, 0) + ' px, Netto ' + fmt(disp, 0) +
-    ' px, Gerichtetheit ' + fmt(results.jetDirected * 100, 0) + '%');
-  log('      Ø Tempo: ' + fmt(path / 300 * 60, 0) + ' px/s  (Karte ist 1440 px breit)');
-  log(results.jetOK ? '  ✅ Jet liefert gerichteten Antrieb — Schwimmen ohne Grip ist möglich.'
-    : '  ❌ Jet zu schwach/ungerichtet.');
+  const best = resultsT4.reduce((a, b) => (b.along > a.along ? b : a));
+  results.gripPull = resultsT4;
+  results.gripPullBest = best.along;
+  results.gripPullOK = best.along > 60;
+  log('');
+  log('  Bester Fall: ' + best.along.toFixed(0) + ' px Vortrieb in Zielrichtung über 10 Zyklen' +
+    ' (' + (best.along / 15).toFixed(1) + ' px/Zyklus).');
+  log(results.gripPullOK
+    ? '  ✅ Grip-and-pull erzeugt echten Vortrieb — der Körper kann den Mechanismus.'
+    : '  ❌ Grip-and-pull zieht nicht — Ankerstärke/Muskelmoment/Geometrie prüfen.');
 }
 
 // ── TEST 5: tentacle collision ────────────────────────────────
@@ -488,7 +551,7 @@ bar('TEST 7 — NN EINGÄNGE / AUSGÄNGE');
   results.inputUsage = { total: inputs.length, currentlyZero: constant };
   log('  Eingänge: ' + inputs.length + ' (davon gerade 0: ' + constant + ')');
   log('  Ausgänge: ' + o.lOut.length + ' | ungenutzt laut Quelltext: ' + (deadOut.length ? deadOut.join(',') : 'keine'));
-  log('  out[0]=Jet-Intensität, out[1]=Jet-Richtung, out[2..25]=6 Arme ×(Schulter,Welle,Krümmung,Saug), out[26]=Echo');
+  log('  out[0]=Wellenfrequenz, out[1]=Muskeltonus, out[2..25]=6 Arme ×(Schulter,Welle,Krümmung,Saugnapf), out[26]=Echo');
   log(deadOut.length === 0 ? '  ✅ Alle Ausgänge verdrahtet.' : '  ⚠️  ' + deadOut.length + ' tote Ausgänge.');
 }
 
@@ -516,7 +579,7 @@ const rows = [
   ['2   Kein Matter-World-Leak', results.wallLeakOK],
   ['3   Kein dominantes Kreiseln (< 6 Umdrehungen)', results.spinOK],
   ['3   Evolution steigert Vorwärtsbewegung', results.learningOK],
-  ['4   Jet-Antrieb funktioniert', results.jetOK],
+  ['4   Grip-and-pull erzeugt Vortrieb', results.gripPullOK],
   ['5   Tentakel kollidieren mit der Welt', results.tentacleOK],
   ['6   step() ohne Exception', !results.stepError],
   ['6   Keine toten kritischen Pfade', (results.deadSymbols || []).length === 0],

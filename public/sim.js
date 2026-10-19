@@ -79,35 +79,31 @@ const SUB_DT     = DT / SUBSTEPS;
 const SUB_COMP   = SUBSTEPS; // Impuls-Kompensation: τ_pro_Substep · SUBSTEPS · (dt/SUBSTEPS)² = τ · dt²
 
 const MAX_LIN_V  = 6.0;      // px/step  ≈ 360 px/s  — hartes Limit, verhindert "aus der Map fliegen"
-const MAX_ANG_V  = 0.20;     // rad/step für Tentakelsegmente
-const MAX_ANG_V_CORE = 0.025; // Mantel dreht träge (Lenkung kommt vom Trichter).
-// Warum das physikalisch stimmt: Ein Oktopus-Mantel ist breit und flach → sehr
-// hoher Rotations-Widerstand im Wasser. Ohne diese Dämpfung addieren sich die
-// Reaktionsmomente der 6 Arme zu einer Dauerdrehung, und der Jet zeichnet dann
-// einen Kreis (gemessen: 1049 px Pfad bei 30 px Netto = geschlossene Bahn).
-// Wasserwiderstand läuft über `frictionAir` im Matter-Integrator, NICHT über
-// nachträgliche setVelocity-Aufrufe (siehe Kommentar bei Pt.step()).
-const DRAG_CORE  = 0.075;    // Mantel
-const DRAG_SEG   = 0.085;    // Armsegmente (dünn, viele → mehr Reibung)
-const DRAG_PREY  = 0.090;    // Beute
+const MAX_ANG_V  = 0.30;     // rad/step für Tentakelsegmente (sonst sättigt der
+                             // stärkere Muskel dauernd am Clamp = Bang-Bang)
+const MAX_ANG_V_CORE = 0.025; // Rumpf dreht träge (breite Auflagefläche → hohe Rotationsreibung).
+// Ohne diese Dämpfung addieren sich die Reaktionsmomente der 6 Arme zu einer
+// Dauerdrehung und das Tier schlägt Haken statt gerade zu ziehen
+// (gemessen vorher: 1049 px Pfad bei 30 px Netto = geschlossene Bahn).
+// ⚠ KEIN WASSER. Die Viecher kriechen auf einer Oberfläche (Draufsicht,
+// gravity = 0). Es gibt keinen Auftrieb, keinen Strömungswiderstand und kein
+// Rudern — Arme im freien Raum erzeugen keinerlei Vortrieb.
+// Was es gibt: Reibung gegen den Untergrund. Die läuft über `frictionAir` im
+// Matter-Integrator (constraint-konsistent), NICHT über nachträgliche
+// setVelocity-Aufrufe — siehe Kommentar bei Pt.step().
+const DRAG_CORE  = 0.075;    // Reibung Rumpf am Untergrund
+const DRAG_SEG   = 0.085;    // Reibung Armsegmente am Untergrund
+const DRAG_PREY  = 0.090;    // Reibung Beute am Untergrund
 const DRAG_ANG   = 0.16;     // Reserve-Winkeldämpfung für Segmente
-const CORE_ANG_DRAG = 0.40;  // zusätzliche Mantel-Rotationsdämpfung als echtes Drehmoment
+const CORE_ANG_DRAG = 0.40;  // Rotationsreibung des Rumpfes am Untergrund (echtes Drehmoment)
 
-const JET_MAX    = 0.85;     // Mantel-Stoß. Gesamtmasse ≈ 131 (Rumpf 26 + 6 Arme à 17.5),
-                             // der Stoß wirkt nur auf den Rumpf und zieht die Arme nach:
-                             // Δv_gesamt ≈ JET_MAX·277.8/131 ≈ 1.8 px/frame pro Puls.
-const FUNNEL_LEVER = 3.5;    // px — Hebelarm des Trichters vor dem Schwerpunkt.
-                             // Ein Oktopus lenkt, indem er den Siphon schwenkt: der
-                             // Strahl läuft dann nicht mehr durch den Schwerpunkt und
-                             // erzeugt ein Drehmoment. Ohne das könnte ein schwerer
-                             // Mantel seine Richtung überhaupt nicht mehr ändern.
-const JET_REFRACT= 0.30;     // s — Refraktärzeit; ~3.3 Stöße/s entspricht einem schwimmenden Oktopus
-const JET_THRESHOLD= 0.45;   // ab welchem out[0] der Mantel überhaupt zündet
-const MUSCLE_TMAX= 0.0045;   // max. Gelenkmoment (Segment-Trägheit ≈ 7 nach Geometrie-Fix → Δω ≈ 0.18 rad/step)
+const MUSCLE_TMAX= 0.0135;   // max. Gelenkmoment. Per Sweep (tools/tune-grip.js) bestimmt:
+                             // ×3 war in allen Top-Konfigurationen der gemeinsame Faktor —
+                             // Ø Vortrieb 64 px → 166 px über 10 Inchworm-Zyklen.
 const MUSCLE_KP  = 0.35;     // PD: proportional — per Sweep (tools/tune.js) bestimmt
 const MUSCLE_KD  = 0.50;     // PD: differential — per Sweep bestimmt, dämpft den Grenzzyklus
-const SHOULDER_TMAX = 0.014; // Schulter: Segment-Trägheit ≈ 10.5 → Δω ≈ 0.37 rad/step (wird
-                             // von MAX_ANG_V begrenzt), reicht um die ganze Armkette zu schwenken (eff. Trägheit ≈ 7×)
+const SHOULDER_TMAX = 0.042; // Schulter muss die ganze Armkette schwenken UND den Zug
+                             // auf den Rumpf übertragen — zusammen mit MUSCLE_TMAX gesweept (eff. Trägheit ≈ 7×)
 
 const N_CONN=6,N_AUD=8;
 const CONN_SEGS=7,CONN_SL=13.5;
@@ -119,6 +115,15 @@ const SHOULDER_LIMIT=Math.PI*0.62;
 // Erzeugt die metachronale Welle über alle Arme. Ohne diesen Rhythmus-
 // Prior muss die Evolution 27 chaotische Ausgänge gleichzeitig entdecken —
 // die stabilste lokale Lösung ist dann "im Kreis zappeln".
+// out[0] und out[1] steuern jetzt zwei GLOBALLE Arm-Parameter — beides reine
+// Muskel-/Gelenk-Stellgrößen, niemals eine Kraft auf den Rumpf:
+const TONE_MIN   = 0.30;     // out[1] = Muskeltonus: 0.30 = schlaff, 1.0 = steif
+const CPG_HZ_MIN = 0.35;     // out[0] = Wellenfrequenz der metachronalen Welle
+const CPG_HZ_MAX = 1.70;     //   (in Vielfachen von CPG_BASE_HZ)
+const SUCK_ON    = 0.15;     // ab hier haftet der Saugnapf an
+const SUCK_OFF   = -0.15;    // erst hierunter lässt er wieder los (Hysterese)
+const GRIP_BREAK = 22;       // px — ab welcher Dehnung ein Saugnapf abreißt
+const GRIP_MAX_TIME = 3.0;   // s — wie lange ein Saugnapf maximal hält
 const CPG_BASE_HZ=1.15;      // Grundfrequenz der Armwelle
 const CPG_WAVE_NUMBER=1.0;   // Phasenversatz pro Arm (1.0 = volle metachronale Welle)
 const DEBRIS=[];             // war undefiniert → latenter Crash in _damTent/takeDamage
@@ -129,7 +134,7 @@ const NSW=64*NH+NH+NH*NH+NH+NH*NO+NO;
 let NEXT_GROUP = -1;
 
 const PHASES=[
-  {id:0,name:'MOTOR PRIMITIVES',  sub:'Jet + arm-wave locomotion',          preyN:0, pSpd:0,  dur:100,gpp:12,mut:{r:.055,m:.16}},
+  {id:0,name:'MOTOR PRIMITIVES',  sub:'Grip & pull — anchor, curl, drag',   preyN:0, pSpd:0,  dur:100,gpp:12,mut:{r:.055,m:.16}},
   {id:1,name:'ECHOLOCATION',      sub:'Map corridors via echo pulses',      preyN:0, pSpd:0,  dur:90, gpp:10,mut:{r:.045,m:.13}},
   {id:2,name:'CHEMOTAXIS',        sub:'Follow scent trails',                preyN:2, pSpd:.4, dur:80, gpp:8, mut:{r:.04,m:.11}},
   {id:3,name:'ACTIVE PURSUIT',    sub:'Chase and grip prey',                preyN:3, pSpd:1.0,dur:80, gpp:8, mut:{r:.035,m:.10}},
@@ -282,21 +287,10 @@ class Pt{
   set px(v){ this.body.positionPrev.x = v }
   set py(v){ this.body.positionPrev.y = v }
 
-  /**
-   * Kraft in "Spiel-Einheiten" (0..±350). Wird massenormiert, damit leichte
-   * Tentakelspitzen nicht 10× stärker beschleunigen als der schwere Körper.
-   * Früher: fester Faktor 0.0006 → Δv bis 116 px/step auf ein 0.5kg-Segment
-   * (= 7000 px/s). Das war die Explosion aus der Map.
-   */
-  force(fx,fy){
-    if(!Number.isFinite(fx)||!Number.isFinite(fy))return;
-    const cfx=clamp(fx,-350,350), cfy=clamp(fy,-350,350);
-    // Ziel-BESCHLEUNIGUNG statt Ziel-Kraft: F = m · a.
-    // Sonst beschleunigt ein 0.5 kg leichtes Spitzen-Segment 16× stärker
-    // als der 8 kg schwere Körper — genau das war die alte Explosion.
-    const k=this.body.mass*0.00055;
-    Body.applyForce(this.body,this.body.position,{x:cfx*k,y:cfy*k});
-  }
+  // KEIN force() mehr. Eine translationale Kraft am Schwerpunkt eines Arms ist
+  // genau das Muster, das hier nicht vorkommen darf: eine von außen aufgedrückte
+  // Schiebekraft, die über den Arm den ganzen Körper mitnimmt. Bewegung entsteht
+  // ausschließlich aus Gelenkmomenten (Pt.torque) und aus Verankerung.
   /**
    * Echtes Drehmoment. `Body.applyForce(b, b.position, f)` erzeugt KEIN
    * Drehmoment (Hebelarm 0) — die alte "Muskel"-Implementierung hat also
@@ -667,15 +661,22 @@ class SuctionCup{
     const tx = pt.x + Math.cos(angle) * tipLen;
     const ty = pt.y + Math.sin(angle) * tipLen;
 
-    // Ein Saugnapf braucht KONTAKT und darf nicht wegrutschen
-    if(Vector.magnitude(pt.body.velocity) > 3.2) return;
+    // Ein Saugnapf kann nicht an einer rasenden Spitze haften. Der Wert ist kein
+    // Flaschenhals (gemessen: Anker-Rate identisch für Gate 2.4 / 5 / 12 / 50 / ∞,
+    // weil abreißende Anker über GRIP_BREAK limitieren, nicht über das Gate) —
+    // 6.0 lässt der KI aber die Freiheit, im Gleiten anzusetzen.
+    if(Vector.magnitude(pt.body.velocity) > 6.0) { this.cd=0.05; return; }
 
     let target = null;
-    // Check preys first
+    // Beute hat Vorrang (beweglicher Greifling)
     for(const pr of preys){if(pr&&Math.hypot(tx-pr.x,ty-pr.y)<pr.r+10){target=pr; break;}}
 
-    // If no prey, must be near a wall to grip
-    if(!target && !map.wallCollide(tx, ty, 9)) { this.cd=0.08; return; }
+    // ⚠ ENTSCHEIDEND: Das Tier kriecht auf einer OBERFLÄCHE. Seine Saugnäpfe
+    // können sich also am Untergrund festhalten — überall, nicht nur an Wänden.
+    // Ohne das gäbe es im offenen Gelände buchstäblich nichts zu halten, und
+    // "Grip and pull" wäre als Fortbewegung unmöglich.
+    // Ein Wandkontakt ist ebenfalls ein gültiger Anker (fester, vertikaler Punkt).
+    if(!target && !OVR.floorGrip && !map.wallCollide(tx, ty, 9)) { this.cd=0.08; return; }
 
     this.gripped=true;
     this.gTarget=target;
@@ -691,10 +692,12 @@ class SuctionCup{
       bodyB: target ? target.body : null,
       pointB: target ? {x:0,y:0} : {x: tx, y: ty},
       // 0.22 war Gummi: der Arm konnte 26 px ziehen ohne Halt.
-      // 0.9/length 0 = echter Ankerpunkt, an dem man sich abstützen kann.
-      stiffness: 0.9,
+      // stiffness 1 / length 0 = starrer Ankerpunkt, an dem man sich wirklich
+      // abstützen und hochziehen kann. angularStiffness 1 verhindert die
+      // Solver-Energieinjektion (siehe Hinweis bei Connectarcle).
+      stiffness: 1,
       length: 0,
-      damping: 0.12,
+      damping: 0.15,
       angularStiffness: 1   // Saugnapf = Gelenk, keine Winkelkopplung
     });
     // Dieselbe Matter-Eigenheit wie bei den Arm-Gelenken: `pointA` muss zum
@@ -718,14 +721,14 @@ class SuctionCup{
     if(!this.gripped)return false;
     this.gTime += DT;
     if(this.cd>0)this.cd-=DT;
-    if(this.gTime > 3.0) { this.release(); return false; }
+    if(this.gTime > GRIP_MAX_TIME) { this.release(); return false; }
     // Breaking force check from TIP position
     const tipLen = CONN_SL / 2;
     const tpos = { x: pt.x + Math.cos(pt.body.angle)*tipLen, y: pt.y + Math.sin(pt.body.angle)*tipLen };
     const anchor = this.gTarget ? this.gTarget.body.position : this.constraint.pointB;
     const bl = anchor ? Vector.magnitude(Vector.sub(tpos, anchor)) : 999;
-    this.load = clamp(bl/14,0,1);          // 0 = entspannt, 1 = kurz vor dem Abriss
-    if(bl > 14) { this.release(); return false; }
+    this.load = clamp(bl/GRIP_BREAK,0,1);   // 0 = entspannt, 1 = kurz vor dem Abriss
+    if(bl > GRIP_BREAK) { this.release(); return false; }
     return true;
   }
   draw(pt,col,suctionOn){
@@ -772,12 +775,11 @@ class Connectarcle{
     this.tipContact=0;
     this.gripLoad=0;
 
-    // MASSENVERTEILUNG — war der Hauptgrund, warum der Jet nicht zog:
-    // lerp(2.0, 0.45) über 7 Segmente = 8.57 pro Arm × 6 Arme = 51 Einheiten,
-    // bei einem Mantel von 12. Also 81 % frei schlenkernde Masse: der Mantel-Stoß
-    // hat fast nur die Arme herumgeworfen statt den Körper zu schieben.
-    // Jetzt ~2.3 pro Arm × 6 = 14 vs. Mantel 12 → Arme 54 %, wie beim echten Tier,
-    // aber der Rumpf bleibt der dominante Trägheitskörper.
+    // MASSENVERTEILUNG. Bei reiner Arm-Fortbewegung sind die Arme zugleich
+    // Aktuator und Reaktionsmasse. Zwei Grenzen gelten:
+    //   • Rumpf : Segment₀ ≤ ~8:1 — Sequential-Impulse-Solver werden darüber instabil
+    //   • Rumpf nicht zu schwer — sonst können die Arme ihn schlicht nicht ziehen
+    // lerp(3.2, 1.8) über 7 Segmente = 17.5 pro Arm × 6 = 105, Rumpf 16.
     // Massen-Taper maximal ~1.8:1 über die Kette, und Rumpf:Segment0 ≈ 8:1.
     // Sequential-Impulse-Solver werden ab ~10:1 instabil.
     const m0=3.2;
@@ -806,6 +808,7 @@ class Connectarcle{
     this.nnAng=[0,0,0];this.worldRestAng=relAng;this.col='#00ffb3';
     this.cups=[new SuctionCup(CONN_SEGS-1)];
     this.suctionOn=false;
+    this.suckLatch=false;   // Hysterese-Zustand des Saugnapfs
     this.constraints=[];
 
     // Schulter-Anchor (pointA ist CORE-LOKAL, wird in layout() konsistent gesetzt)
@@ -928,9 +931,10 @@ class Connectarcle{
    * Der alte Code benutzte `Body.applyForce(b, b.position, f)` — Hebelarm 0,
    * also NULL Drehmoment. Segmente wurden nur verschoben, nie gebeugt.
    */
-  applyMuscles(){
+  applyMuscles(tone){
     const n=this.active+1;
     if(n<1||!this.alive)return;
+    const T=(tone===undefined?1:tone);            // globaler Muskeltonus 0.30..1.0
     const core=this.parent, s0=this.pts[0].body;
 
     // ── Schulter ──
@@ -938,18 +942,22 @@ class Connectarcle{
     const tgtS=clamp(this.ctrl.shoulder,-SHOULDER_LIMIT,SHOULDER_LIMIT);
     const avS=s0.angularVelocity-core.angularVelocity;
     let tauS=(MUSCLE_KP*(tgtS-relS)-MUSCLE_KD*avS);
-    tauS=clamp(tauS,-1,1)*SHOULDER_TMAX*SUB_COMP;
+    tauS=clamp(tauS,-1,1)*SHOULDER_TMAX*T*SUB_COMP;
     s0.torque+=tauS;
-    core.torque-=tauS;                    // Reaktion dreht den Mantel mit (physikalisch korrekt)
+    core.torque-=tauS;                    // Actio = Reactio: der Rumpf dreht gegen
 
-    // ── Ellbogen-/Fingergelenke (interne Paare → kein Nettomoment auf den Körper) ──
+    // ── Ellbogen-/Fingergelenke ──
+    // Diese Paare sind INTERN zur Armkette: +tau an B, -tau an A. Sie erzeugen
+    // kein Nettomoment auf den Körper und schon gar keine Nettokraft. Sie können
+    // den Rumpf nur bewegen, indem sie den Arm verkürzen/verlängern — und das
+    // zieht ausschließlich dann am Rumpf, wenn die Spitze verankert ist.
     for(let i=1;i<n;i++){
       const A=this.pts[i-1].body, B=this.pts[i].body;
       const rel=angDiff(B.angle,A.angle);
       const tgt=clamp(this.ctrl.curl+this.waveAt(i),-JOINT_LIMIT,JOINT_LIMIT);
       const av=B.angularVelocity-A.angularVelocity;
       let tau=(MUSCLE_KP*(tgt-rel)-MUSCLE_KD*av);
-      tau=clamp(tau,-1,1)*MUSCLE_TMAX*SUB_COMP;
+      tau=clamp(tau,-1,1)*MUSCLE_TMAX*T*SUB_COMP;
       B.torque+=tau;
       A.torque-=tau;
     }
@@ -1073,10 +1081,6 @@ class Prey{
   get vy(){return this.body.velocity.y}
   set vx(v){Body.setVelocity(this.body,{x:v,y:this.body.velocity.y})}
   set vy(v){Body.setVelocity(this.body,{x:this.body.velocity.x,y:v})}
-  knock(dx,dy,power=1){
-    const v=this.body.velocity;
-    Body.setVelocity(this.body,{x:clamp(v.x+dx*power,-7,7),y:clamp(v.y+dy*power,-7,7)});
-  }
   tick(preds){
     let fx=0,fy=0;
     for(const p of preds){
@@ -1148,10 +1152,11 @@ class Organism{
     this.lIn=new Float32Array(NI);this.lOut=new Float32Array(NO);this.prevOut=new Float32Array(NO);
 
     // PERFECT RIGID BODY PHYSICS
-    // Rumpfmasse 26. Zusammen mit der reparierten Kapsel-Geometrie bleibt das
-    // Trägheitsverhältnis Rumpf→Segment0 bei ~8:1 (Solver-stabil) und der Rumpf
-    // ist trotzdem der dominante Richtungs-Anker.
-    this.pt = new Pt(x, y, 26, 18, false, {
+    // Rumpfmasse 16. Bei reiner Arm-Fortbewegung sind die Arme Aktuatoren UND
+    // Reaktionsmasse — ein zu schwerer Rumpf ist von den Armen schlicht nicht
+    // mehr zu ziehen. 16 : 3.2 (Segment 0) = 5:1, bleibt solver-stabil, und der
+    // Sweep hat genau hier den meisten Vortrieb gemessen.
+    this.pt = new Pt(x, y, 16, 18, false, {
       category: COL_CORE,
       mask: COL_WALL | COL_PREY,
       group: this.group // Share the same negative group as tentacles to avoid self-stuckness
@@ -1173,16 +1178,17 @@ class Organism{
     this.auds=AUD_ANGS.map(a=>new Auditarcle(a));
     // Echolocation
     this._echoT=rng(.5,1.5);this._echoInterval=rng(1.0,2.2);this._echoCooldown=0;
-    // ── CPG / Jet ──
+    // ── CPG / Muskeltonus ──
     this.cpg=rnd()*Math.PI*2;      // zentrale Uhr der metachronalen Welle
     this.cpgHz=CPG_BASE_HZ;
-    this.jetCharge=1;              // 0..1 Mantelfüllung
-    this.jetRefract=0;
-    this.jetCmd=0;this.jetAim=0;
-    this.lastJetV=0;
-    this._jetF=0;                  // Schub-Vektor für den nächsten Substep
+    this.waveCmd=0;                // out[0] → Wellenfrequenz
+    this.tone=1;                   // out[1] → Muskeltonus 0.30..1.0
     this.faceAng=this.ang-Math.PI*0.5;
     this.age=0;
+    this.anchorTicks=0;            // Steps mit ≥1 verankertem Arm
+    this.grippedNow=0;             // aktuell verankerte Arme
+    this.armReach=0;               // mittlere Schulter→Spitze-Distanz (Armstreckung)
+    this.anchorAtSpawn=0;
     // Fitness metrics (comprehensive)
       this.fitness=0;this.hits=0;this.wallHits=0;this.chemSensed=0;this.stepCount=0;
     this.gripCount=0;this.echoResponses=0;
@@ -1193,7 +1199,6 @@ class Organism{
     this.angularAccum=0;      // total rotation (spinning penalty) — war NIE verdrahtet
     this.pathLen=0;           // tatsächlich gelaufene Pfadlänge
     this.forwardProg=0;       // Σ max(0, v·Richtung) — nur echte Vorwärtsbewegung
-    this.jetImpulse=0;        // aufgewendeter Jet-Schub
     this.gripPullProg=0;      // Vorwärtsbewegung während ≥2 Armen halten
     this.resets=0;
     // Exploration
@@ -1266,8 +1271,8 @@ class Organism{
     this.vx = this.pt.body.velocity.x; this.vy = this.pt.body.velocity.y;
     this.ang = this.pt.body.angle; this.av = this.pt.body.angularVelocity;
     // Die Augen werden bei lokalem -y gezeichnet → das ist die "Blickrichtung".
-    // Jet-Schub und Vorwärts-Fitness benutzen dieselbe Achse, sonst lernt das
-    // Netz Fortbewegung in eine Richtung, die es optisch nicht gibt.
+    // Die Vorwärts-Fitness benutzt dieselbe Achse, sonst würde die Evolution
+    // Fortbewegung in eine Richtung belohnen, die es optisch gar nicht gibt.
     this.faceAng = this.ang - Math.PI*0.5;
     const mv = this.pt.spd();
 
@@ -1285,31 +1290,18 @@ class Organism{
     // ══ CPG: metachronale Welle ══════════════════════════════
     // Ohne diesen Rhythmus-Prior ist "im Kreis zappeln" die stabilste
     // Lösung die die Evolution findet (gemessen: 198 Umdrehungen/Gen).
-    this.cpgHz = CPG_BASE_HZ*(0.7+0.6*this.arousal);
     this.cpg = (this.cpg + Math.PI*2*this.cpgHz*DT) % (Math.PI*2);
 
-    // ══ JET-ANTRIEB (out[0]/out[1] waren vorher tote Ausgänge) ══
-    // Echter Cephalopoden-Antrieb: Mantel füllen → refraktär → Stoß.
-    this.jetCmd  = out[0];
-    this.jetAim  = clamp(out[1],-1,1)*0.95;   // Trichter lenkt den Strahl ±54° — so steuert ein Oktopus
-    if(this.jetRefract>0) this.jetRefract-=DT;
-    this.jetCharge=clamp(this.jetCharge+DT*2.1,0,1);
-    this._jetF=0;
-    // Schwelle 0.45 statt 0.2 und lineare Skalierung DARÜBER:
-    // Mit 0.2 feuerten ~100 % aller Zufallsgenome dauerhaft (gemessen 66 von 66
-    // möglichen Pulsen) — es gab also keinen Selektionsgradienten fürs Jeten.
-    const jc=(this.jetCmd-JET_THRESHOLD)/(1-JET_THRESHOLD);
-    if(jc>0 && this.jetRefract<=0 && this.jetCharge>0.4 && this.energy>0.05 && OVR.ai){
-      const strength=clamp(jc,0,1)*this.jetCharge*(0.45+0.55*this.energy);
-      this._jetF=JET_MAX*strength*SUB_COMP;
-      this.jetCharge=0; this.jetRefract=JET_REFRACT;
-      this.energy=clamp(this.energy-strength*0.055,0,1);
-      this.energySpent+=strength*1.6;
-      this.jetImpulse+=strength;
-      this.lastJetV=strength;
-      emitSound(this.x-Math.cos(this.faceAng)*20,this.y-Math.sin(this.faceAng)*20,strength*.5,'emit');
-      if(strength>.55) spawnFX(this.x-Math.cos(this.faceAng)*22,this.y-Math.sin(this.faceAng)*22,this.col,4);
-    }else this.lastJetV*=.85;
+    // ══ GLOBALE ARM-STELLGRÖSSEN (out[0], out[1]) ══
+    // Beide sind reine Muskel-/Gelenk-Parameter. Es wird an keiner Stelle eine
+    // Kraft auf den Rumpf ausgeübt — Fortbewegung entsteht ausschließlich daraus,
+    // dass verankerte Arme sich einknicken und dabei kürzer werden.
+    //   out[0] → Frequenz der metachronalen Welle
+    //   out[1] → Muskeltonus (schlaff ↔ steif)
+    this.waveCmd = OVR.ai ? out[0] : 0;
+    this.tone    = OVR.ai ? (TONE_MIN + (1-TONE_MIN)*(0.5+0.5*clamp(out[1],-1,1))) : 0;
+    if(this.energy<0.15) this.tone*=clamp(this.energy/0.15,0,1);   // erschöpft → Arme werden weich
+    this.cpgHz = CPG_BASE_HZ*(CPG_HZ_MIN + (CPG_HZ_MAX-CPG_HZ_MIN)*(0.5+0.5*clamp(this.waveCmd,-1,1)));
 
     // ── Tentakel-Steuerung ──
     let gripNow=0;
@@ -1318,7 +1310,18 @@ class Organism{
       const oShoulder = out[2+k*4+0]||0;   // Schulter-Zielwinkel
       const oWave     = out[2+k*4+1]||0;   // Amplitude der metachronalen Welle
       const oCurl     = out[2+k*4+2]||0;   // statische Ruhekrümmung
-      let suctionOn   = (out[2+k*4+3]||0) > 0.1;
+      // ── Saugnapf mit HYSTERESE (Latch) ──
+      // Vorher: `suctionOn = out[..] > 0.1` und der Wert wird JEDEN Frame neu aus
+      // dem Netz gelesen. Ein einziger Frame knapp unter der Schwelle ließ den
+      // Anker sofort los (gemessen: 32 erfolgreiche Grips, aber nur 0.5 % der
+      // Schritte mit Anker — jeder Grip wurde im selben Frame wieder gelöscht).
+      // Für die Evolution ist das ein praktisch unlernbares Nadelöhr.
+      // Echte Saugnäpfe haften passiv: Anhaften ist eine Entscheidung, Halten
+      // kostet fast nichts, und gelöst wird erst durch bewusste Entspannung.
+      const suckRaw = out[2+k*4+3]||0;
+      if (suckRaw >  SUCK_ON)  c.suckLatch = true;
+      else if (suckRaw < SUCK_OFF) c.suckLatch = false;
+      let suctionOn = !!c.suckLatch;
       if (!OVR.ai) suctionOn = false;
 
       let eMult = 1.0;
@@ -1326,7 +1329,8 @@ class Organism{
       if (this.energy < 0.05) suctionOn = false;
 
       const effort = (Math.abs(oShoulder) + Math.abs(oWave) + Math.abs(oCurl)) / 3.0 * eMult;
-      const eCost = (effort * 0.00055) + (suctionOn ? 0.00016 : 0);
+      const gripCost = suctionOn ? (c.cups.some(sx=>sx.gripped) ? 0.00004 : 0.00022) : 0;
+      const eCost = (effort * 0.00055) + gripCost;   // Halten ist billig, neu Ansaugen teuer
       this.energySpent += eCost * 10.0;
       this.energy -= eCost;
 
@@ -1357,10 +1361,17 @@ class Organism{
     if(gripNow>0){
       this.gripMoveDist+=Math.max(0,fwd);
       if(fwd>.12)this.gripMoveCorr++;
-      if(gripNow>=2&&fwd>0)this.gripPullProg+=fwd;
+      this.grippedNow=gripNow;
+      this.anchorTicks++;
+      if(fwd>0)this.gripPullProg+=fwd;   // bereits EIN Anker reicht zum Ziehen
     }else{
+      this.grippedNow=0;
       if(stepDist>.3)this.freeMoveDist+=stepDist;
     }
+    // Armreichweite jetzt (Schulter→Spitze gemittelt) — für Propriozeption/Debug
+    let rSum=0,rN=0;
+    for(const c of this.conns){ if(!c.alive)continue; rSum+=Math.hypot(c.tipX-this.x,c.tipY-this.y); rN++; }
+    this.armReach=rN?rSum/rN:0;
 
     const hx=false, hy=false; // removed manual walls
     this.bodyPress*=0.83;
@@ -1391,28 +1402,26 @@ class Organism{
     this.energy=clamp(this.energy - mv*.00016 - Math.abs(this.av)*.0002 + .0022, 0, 1);
     this.satiation=clamp(this.satiation-.0002,0,1);
     this.discomfort=clamp(this.discomfort+((hx||hy)?.06:-.004),0,1);
-    this.arousal=lerp(this.arousal,clamp(mv*.2+Math.abs(this.av)*.14+this.lastJetV*.5,0,1),.05);
+    this.arousal=lerp(this.arousal,clamp(mv*.22+Math.abs(this.av)*.16+this.tone*.35,0,1),.05);
     this.fitness+=this.satiation*.36*DT+this.energy*.08*DT;
   }
 
-  /** Wird pro Physik-Substep aufgerufen: Muskeln + Jet + Wasserwiderstand. */
+  /**
+   * Wird pro Physik-Substep aufgerufen.
+   *
+   * Es wirkt hier ABSICHTLICH keine Kraft auf den Rumpf. Der Rumpf bewegt sich
+   * ausschließlich als Reaktion auf die Gelenkmomente der Arme — und zwar nur
+   * dann nennenswert, wenn mindestens ein Arm irgendwo verankert ist. Dann
+   * knickt der Arm ein, wird kürzer, und zieht den Rumpf an den Anker heran
+   * (oder zieht einen leichten Greifling an den Rumpf heran — dieselbe Logik,
+   * der Constraint-Solver teilt nur massengewichtet auf).
+   */
   applyMuscles(){
-    for(const c of this.conns) if(c.alive) c.applyMuscles();
-    const b=this.pt.body;
-    // Zusätzliche Rotationsdämpfung des Mantels — als physikalisches Drehmoment,
-    // damit Matter sie konsistent mit den Constraints integriert.
+    for(const c of this.conns) if(c.alive) c.applyMuscles(this.tone);
+    // Rotationsreibung des Rumpfes am Untergrund — als echtes Drehmoment, damit
+    // Matter es konsistent mit den Constraints integriert.
     // τ = -c·ω·I/Δt²  (mit SUB_COMP, weil pro Substep applied)
-    b.torque -= CORE_ANG_DRAG*b.angularVelocity*b.inertia/M_DT2*SUB_COMP;
-    if(this._jetF){
-      // Trichter um jetAim geschwenkt → Strahl zeigt nicht mehr durch den
-      // Schwerpunkt → Drehmoment. Das ist die einzige Lenkachse des Kraken.
-      const aim=clamp(this.jetAim,-1,1);
-      const a=this.faceAng+aim*0.95;
-      const lever=FUNNEL_LEVER*aim;
-      const lat=a+Math.PI*0.5;
-      const ap={x:b.position.x+Math.cos(lat)*lever, y:b.position.y+Math.sin(lat)*lever};
-      Body.applyForce(b,ap,{x:Math.cos(a)*this._jetF,y:Math.sin(a)*this._jetF});
-    }
+    this.pt.body.torque -= CORE_ANG_DRAG*this.pt.body.angularVelocity*this.pt.body.inertia/M_DT2*SUB_COMP;
   }
 
   /**
@@ -1454,76 +1463,71 @@ class Organism{
     this.discomfort=Math.min(1,this.discomfort+.55);
   }
 
+  /**
+   * Fitness — vollständig auf "Ankern, Arm einknicken, heranziehen" ausgerichtet.
+   *
+   * Warum die alte Formel Kreiseln erzeugt hat:
+   *   gripLoco = gripMoveDist*3.5 mit gripMoveDist = Σ|v|, solange IRGENDEIN Arm
+   *   hält. Drehen auf der Stelle liefert volles |v|, keinen Drift-Penalty und
+   *   fast keinen Energieaufwand → Score steigt, Fortschritt = 0. Gemessen am
+   *   Original: Score 3244 bei 109 px echter Distanz und 198.8 Umdrehungen.
+   *   Dazu: `angularAccum` war als "spinning penalty" deklariert, wurde aber nie
+   *   erhöht; `wallHits` ebenfalls nie; und
+   *   `effectiveIdleP = max(0, idleP − energySpent*1.5)` belohnte Verschwendung.
+   *
+   * Alle Terme unten sind (a) lageunabhängig — kein Spawn-Glück — und (b) einzeln
+   * nicht farmbar: Zappeln liefert weder pullRate noch reach noch expl.
+   */
   score(phId){
-    const expl = this.visited.reduce((s,v)=>s+v,0)/560;
-    const dur  = Math.max(1,(this.age||0));
-    const echoBonus = Math.min(this.echoResponses, 600) * 0.06;
-
-    // ══ SPAWN-UNABHÄNGIGE KERNMETRIKEN ══
-    // `maxDisplacement` allein ist pures Glück: wer in einer Nische mit Wand im
-    // Rücken spawnt, kann nie weit kommen — und die Evolution selektiert dann
-    // Spawn-Lotterie statt Fortbewegung (gemessen: Score schwankt 164..571 ohne
-    // Trend über 22 Generationen). Diese drei Größen sind lageunabhängig:
     const steps = Math.max(1, Math.round((this.age||DT)/DT));
-    const meanSpeed   = this.pathLen/steps;                              // px/step
-    const directed    = this.pathLen>1 ? this.maxDisplacement/this.pathLen : 0;  // 0=zappeln, 1=geradeaus
-    const headingHold = 1 - clamp(this.angularAccum/(steps*MAX_ANG_V_CORE), 0, 1);
-    // gerichtete Reisegeschwindigkeit — durch Kreiseln NICHT farmbar
-    const cruiseSpeed = meanSpeed*directed;
-    // Anteil des VERFÜGBAREN Freiraums, der tatsächlich erreicht wurde (0..1.2).
-    // Spawn-fair: eine Nische zählt nicht gegen das Individuum.
-    const reach = clamp(this.maxDisplacement/Math.max(70,this.spawnReach||400), 0, 1.2);
+    const dur   = Math.max(1,(this.age||0));
+    const expl  = this.visited.reduce((s,v)=>s+v,0)/560;
 
-    // ══ Warum die alte Formel Kreiseln erzeugt hat ══
-    //   gripLoco = gripMoveDist*3.5  mit gripMoveDist = Σ|v| (solange IRGENDEIN
-    //   Arm hält). Drehen auf der Stelle liefert volles |v|, keinen Drift-Penalty
-    //   und fast keine Energie → Score steigt, Fortschritt = 0.
-    //   `angularAccum` wurde deklariert aber NIE hochgezählt, der Spin-Penalty
-    //   existierte also nur als Kommentar.
-    //   `effectiveIdleP = max(0, idleP − energySpent*1.5)` hat Energie-
-    //   Verschwendung sogar BELOHNT.
-    // ══════════════════════════════════════════════════
-    // `forwardProg` allein ist farmbar: vor/zurück zappeln auf der Stelle
-    // summiert nur die Vorwärts-Halbwellen. Netto-Verschiebung + neu betretene
-    // Rasterzellen sind nicht farmbar — wer im Kreis zappelt, bekommt 0.
-    // Gewichtung: Skill-Terme (lageunabhängig) dominant, Glücks-Term klein.
-    //   cruiseSpeed  = meanSpeed·directed     → schnell UND geradeaus  (Skill)
-    //   headingHold  = 1 − |ω|-Budget         → ruhiger Kurs           (Skill)
-    //   expl         = neu betretene Zellen   → bounded [0,1], vergleichbar
-    //   maxDisplacement                      → spawn-abhängig, nur Bonus
-    // Alle Terme sind lageunabhängig und einzeln nicht farmbar:
-    //   reach       → wieviel vom verfügbaren Raum erreicht wurde
-    //   directed    → Geradlinigkeit (Zappeln → 0, Kreiseln → 0)
-    //   headingHold → ruhiger Kurs
-    //   expl        → neu betretene Rasterzellen (bounded, vergleichbar)
-    //   meanSpeed   → überhaupt mobil sein (kleines Gewicht, sonst Zappel-Anreiz)
-    const travel   = reach*240 + directed*95 + headingHold*45 + expl*1800 + meanSpeed*40;
-    const gripLoco = this.gripPullProg*2.2;                 // Kriechen mit ≥2 Armen
-    const spinP    = this.angularAccum*0.55;                // JETZT verdrahtet
-    const wallP    = this.wallHits*0.35;                    // JETZT verdrahtet
-    const idleP    = this.effectiveIdlePenalty*4.0;
-    const cost     = this.energySpent*0.30;
-    // Effizienz: gerichtete Strecke pro aufgewendeter Energie
-    const eff      = (travel+gripLoco)/Math.max(0.6,this.energySpent);
-    // Chemotaxis: mittlerer Geruchswert statt endloser Summe
+    const meanSpeed   = this.pathLen/steps;                                       // px/step
+    const directed    = this.pathLen>1 ? this.maxDisplacement/this.pathLen : 0;   // 0=zappeln, 1=gerade
+    const headingHold = 1 - clamp(this.angularAccum/(steps*MAX_ANG_V_CORE), 0, 1);
+    // Anteil des beim Spawn vermessenen Freiraums, der erreicht wurde → spawn-fair
+    const reach       = clamp(this.maxDisplacement/Math.max(70,this.spawnReach||400), 0, 1.2);
+
+    // ── DER MECHANISMUS ──
+    // pullRate = Vorwärts-px pro Step, die WÄHREND einer Verankerung zustande
+    // kamen. Das ist exakt "Saunapf hält, Arm knickt ein, Rumpf wird herangezogen".
+    // Ohne Anker gibt es keinen Beitrag; Anker ohne Ziehen zahlt nur `cost`.
+    const pullRate  = (this.gripPullProg||0)/steps;
+    const anchorUse = clamp(this.anchorTicks/steps, 0, 1);
+
+    const travel = pullRate*1100          // Ziehen mit Anker  — Hauptanreiz
+                 + reach*240              // Freiraum-Ausnutzung
+                 + directed*95            // Geradlinigkeit
+                 + headingHold*45         // ruhiger Kurs
+                 + expl*1800              // neu betretene Rasterzellen (bounded, vergleichbar)
+                 + meanSpeed*40           // überhaupt mobil sein (klein, sonst Zappel-Anreiz)
+                 + anchorUse*12;          // Verankern allein zahlt fast nichts
+
+    const spinP = this.angularAccum*0.55;             // endlich verdrahtet
+    const wallP = this.wallHits*0.35;                 // endlich verdrahtet
+    const idleP = this.effectiveIdlePenalty*4.0;
+    const cost  = this.energySpent*0.30;
+    const eff   = travel/Math.max(0.6,this.energySpent);   // Strecke pro Energie
+    const echoBonus = Math.min(this.echoResponses, 600)*0.06;
+    // Chemotaxis: mittlerer Geruchswert statt endlos aufsummierter Rohwerte
     const chemAvg  = (this.chemSensed/Math.max(1,this.stepCount||1))*dur*0.35;
     const preyNear = Math.max(0,(500-(this._preyMinDist||500))*0.06);
 
     switch(phId){
-      // Exploration ist der stärkste nicht-farmbare Anreiz: jede neu betretene
-      // Rasterzelle zählt genau einmal. Kreiseln → 0 neue Zellen.
-      case 0: // Locomotion focus
-        return travel + gripLoco + eff*3 - spinP - wallP - idleP - cost;
-      case 1: // Echo focus
-        return travel + gripLoco + eff*2 + echoBonus*10 - spinP - wallP - idleP - cost;
-      case 2: // Hunting focus
-        return travel + gripLoco + chemAvg*6 + preyNear + eff*2 - spinP - wallP - idleP - cost;
+      case 0: // MOTOR PRIMITIVES — Ankern und Ziehen lernen
+        return travel + eff*3 - spinP - wallP - idleP - cost;
+      case 1: // ECHOLOCATION
+        return travel + eff*2 + echoBonus*10 - spinP - wallP - idleP - cost;
+      case 2: // CHEMOTAXIS
+        return travel + chemAvg*6 + preyNear + eff*2 - spinP - wallP - idleP - cost;
       case 3:
-      case 4:
-        return this.hits*25 + this.satiation*20 + travel*0.6 + gripLoco + preyNear*1.5 + eff*2 - spinP - wallP - idleP - cost;
+      case 4: // ACTIVE PURSUIT / EVASIVE PREY
+        return this.hits*25 + this.satiation*20 + travel*0.6 + preyNear*1.5 + eff*2
+             - spinP - wallP - idleP - cost;
       default: // FREE EMERGENCE
-        return this.hits*30 + this.satiation*22 + travel*0.8 + gripLoco*1.2 + chemAvg*4
-             + echoBonus*6 + eff*3 - spinP*1.2 - wallP - idleP - cost;
+        return this.hits*30 + this.satiation*22 + travel*0.8 + chemAvg*4 + echoBonus*6 + eff*3
+             - spinP*1.2 - wallP - idleP - cost;
     }
   }
 
@@ -1636,9 +1640,9 @@ function stepPhysics(orgs, preys){
         if(!c.alive)continue;
         const tip=c.tip; if(!tip) continue;
         if(Math.hypot(tip.x-p.x,tip.y-p.y) < p.r+9 && tip.spd()>0.9){
-          // Vorher: `p.vx += tip.vx()*2` — Prey hatte gar keine vx/vy-Property,
-          // der Knockback ist also komplett verpufft.
-          p.knock(tip.vx(),tip.vy(),0.9);
+          // Kein Knockback per setVelocity mehr — das wäre eine von außen
+          // aufgedrückte Geschwindigkeit. Tentakel und Beute kollidieren echt
+          // (mask COL_PREY), der Impulsübergang kommt aus dem Solver.
           p.panic=1; p.hitCd=0.6;
           o.onHit();
           spawnFX(p.x,p.y,'#ffcc44',5);
@@ -1736,7 +1740,7 @@ class PlaySession{
           if(!p) continue;
           if(p.hitCd>0){ p.hitCd-=DT; continue; }
           if(Math.hypot(tip.x-p.x,tip.y-p.y)<p.r+9&&tip.spd()>0.9){
-            p.knock(tip.vx(),tip.vy(),1.0); p.panic=1; p.hitCd=0.6; this.org.onHit();
+            p.panic=1; p.hitCd=0.6; this.org.onHit();
             spawnFX(p.x,p.y,'#ffcc44',5);
           }
         }
@@ -1751,7 +1755,7 @@ class PlaySession{
 // ─── GLOBAL STATE ─────────────────────────────────────────
 let evlv=null,playS=null,simMode='TRAIN';
 let paused=false,speed=1,autoEvo=true,popSz=MOB?6:8,mapRegenInterval=5;
-const OVR={ch:true,sw:false,lt:false,col:false,ai:true,noCol:false};
+const OVR={ch:true,sw:false,lt:false,col:false,ai:true,noCol:false,floorGrip:true};
 let _spsAcc=0,_spsT=0,_sps=0;
 
 function setMode(m){
@@ -1904,6 +1908,8 @@ function updateHUD(){
     {n:'AROUSAL',  v:best.arousal,     c:'#b060ff'},
     {n:'ECHO SENSE',v:best.echoSense,  c:'#c050ff'},
     {n:'GRIP LOCO', v:clamp(best.gripMoveDist/200,0,1),c:'#00ffb3'},
+    {n:'ANCHORS',  v:clamp((best.grippedNow||0)/N_CONN,0,1),c:'#7fe7ff'},
+    {n:'ARM CURL', v:clamp((best.armReach||0)/118,0,1),      c:'#ff8040'},
   ];
   const elVit = document.getElementById('vit');
   if(elVit) elVit.innerHTML=vs.map(v=>`<div class="vr"><div class="vn">${v.n}</div><div class="vbx"><div class="vbf" style="width:${(v.v*100).toFixed(1)}%;background:${v.c}"></div></div></div>`).join('');
