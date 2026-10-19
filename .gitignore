@@ -7,3 +7,4 @@ coverage/
 !.env.example
 tools/*.json
 !tools/reports/*.json
+out/

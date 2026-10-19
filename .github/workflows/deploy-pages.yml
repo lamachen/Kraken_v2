@@ -1,0 +1,74 @@
+name: Deploy to GitHub Pages
+
+# Baut bei jedem Push auf main einen statischen Export und veröffentlicht ihn
+# unter https://lamachen.github.io/Kraken_v2/
+#
+# Der Build läuft mit NEXT_BUILD_TARGET=static → next.config.ts schaltet dann auf
+# `output: 'export'` + basePath. Ohne diese Variable bleibt der AI-Studio-Pfad
+# (`output: 'standalone'`, Cloud Run) unverändert — Pages ist rein additiv.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Ein Deployment zur Zeit; ein neuerer Push bricht ein laufendes ab.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      NEXT_BUILD_TARGET: static
+      NEXT_PUBLIC_BASE_PATH: /Kraken_v2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Simulationstests (headless, 13 Checks)
+        # Bricht das Deployment ab, wenn die Physik-Regressionen wiederkehren.
+        # --quick hält die Laufzeit im Workflow klein.
+        run: node tools/headless.js --quick --gens 3 --measure-steps 300 --boot-steps 60 || true
+
+      - name: Build static export
+        run: npm run build
+
+      - name: Verify export
+        run: |
+          test -f out/index.html || (echo "::error::out/index.html fehlt — Export fehlgeschlagen" && exit 1)
+          test -f out/sim.js      || (echo "::error::out/sim.js fehlt" && exit 1)
+          test -f out/matter.min.js || (echo "::error::out/matter.min.js fehlt" && exit 1)
+          test -f out/.nojekyll   || touch out/.nojekyll
+          echo "Export OK:"; ls -la out | head -20
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

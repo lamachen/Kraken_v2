@@ -31,6 +31,17 @@ if (typeof window !== 'undefined') {
   });
 }
 
+/**
+ * GitHub-Pages liegt unter https://<user>.github.io/<repo>/ — Assets müssen
+ * deshalb mit basePath geladen werden. NEXT_PUBLIC_BASE_PATH wird von Next zur
+ * Buildzeit inline ersetzt (vom Workflow gesetzt), im AI-Studio-Build ist es
+ * leer und die Pfade bleiben wurzelrelativ wie bisher.
+ *
+ * Wichtig: Next rewritten MANUELL erzeugte <script src> nicht. Ohne dieses
+ * Präfix würde /sim.js auf Pages 404 liefern und die Simulation nie starten.
+ */
+const BASE = process.env.NEXT_PUBLIC_BASE_PATH || '';
+
 export default function SimulationPage() {
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -59,7 +70,7 @@ export default function SimulationPage() {
         // 1. Ensure Matter library is loaded and ready
         if (!(window as any).__MTR__ || !(window as any).__MTR__.Engine) {
           try {
-            await loadScript('/matter.min.js', 'matter-lib-script');
+            await loadScript(BASE + '/matter.min.js', 'matter-lib-script');
             if ((window as any).Matter && (window as any).Matter.Engine) {
               (window as any).__MTR__ = (window as any).Matter;
               try { if ((window as any).Matter) (window as any).Matter = undefined; } catch (e) {}
@@ -85,7 +96,7 @@ export default function SimulationPage() {
         // sim.js hat dafür einen __simBooted-Guard; vorher entstanden zwei
         // Evolver im selben Matter-World (gemessen: 527 statt 269 Bodies, also
         // 6 unsichtbare Geister-Kraken, die nie getickt aber immer kollidiert sind).
-        await loadScript('/sim.js?v=' + Date.now(), 'sim-engine-script');
+        await loadScript(BASE + '/sim.js?v=' + Date.now(), 'sim-engine-script');
         if (typeof (window as any).bootSimulation === 'function') {
           (window as any).bootSimulation();
         }
