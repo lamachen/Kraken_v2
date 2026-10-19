@@ -126,11 +126,24 @@ const GRIP_BREAK = 22;       // px — ab welcher Dehnung ein Saugnapf abreißt
 const GRIP_MAX_TIME = 3.0;   // s — wie lange ein Saugnapf maximal hält
 const CPG_BASE_HZ=1.15;      // Grundfrequenz der Armwelle
 const CPG_WAVE_NUMBER=1.0;   // Phasenversatz pro Arm (1.0 = volle metachronale Welle)
+const PULL_ASYM=1.8;         // >1 = langsam strecken, schnell ziehen.
+                             // Eine symmetrische Sinuswelle zieht im Mittel genau-
+                             // soweit zurück wie sie holt — der Gang braucht diese
+                             // Asymmetrie, damit überhaupt Netto-Vortrieb entsteht.
 const DEBRIS=[];             // war undefiniert → latenter Crash in _damTent/takeDamage
-// Suction cups at tip, 57%, 28% of tentacle length
-const SUCTION_IDX = [CONN_SEGS];
-const NI=64,NH=32,NO=27;
-const NSW=64*NH+NH+NH*NH+NH+NH*NO+NO;
+// Saugnäpfe sitzen bei echten Cephalopoden auf der GANZEN Arm-Unterseite.
+// Der alte Wert [CONN_SEGS] = [7] lag außerhalb des Segmente-Arrays (0..6) und
+// wurde außerdem gar nicht benutzt — es gab einen einzigen Napf ganz außen.
+// Drei Näpfe pro Arm = 18 Ankerpunkte: zusammen mit OVR.floorGrip kann die KI
+// damit auch mehrarmig koordiniert ziehen, nicht nur mit einer einzigen Spitze.
+const SUCTION_IDX = [2, 4, CONN_SEGS-1];
+// NI 64 → 104: 40 neue Eingänge sind PROPRIOZEPTION.
+// Bisher standen Echolot, Chemie, Licht, Grip-Status, Tempo und Wandnähe drin —
+// aber kein einziger Gelenkwinkel. Die KI war blind für die Pose ihrer eigenen
+// Arme, ein Körpermodell konnte so nicht entstehen. Layout siehe buildInputs().
+const NI=104,NH=32,NO=27;
+const NSW=NI*NH+NH+NH*NH+NH+NH*NO+NO;   // war hartkodierte 64 → hätte abgeschnitten
+const ARM_REACH=24+CONN_SEGS*CONN_SL;   // 118.5 px — Normierung der Propriozeption
 let NEXT_GROUP = -1;
 
 const PHASES=[
@@ -183,13 +196,17 @@ function wrapAngle(a){let d=a%TAU;if(d>Math.PI)d-=TAU;else if(d<-Math.PI)d+=TAU;
 
 // ─── NEURAL NETWORK ─────────────────────────────────────
 function nnNew(){const w=new Float32Array(NSW);for(let i=0;i<w.length;i++)w[i]=(rnd()-.5)*1.6;return w}
+// Geteilte Scratch-Puffer: nnFwd lief pro Sim-Schritt 8× und hat dabei je 3
+// Float32Arrays allokiert — 24 Objekte/Step bzw. ~1440/s, die den GC beschäftigt
+// und die Simulationsrate gedrückt haben.
+// ACHTUNG: `out` ist damit GETEILT. Aufrufer müssen den Inhalt sofort sichern
+// (Organism.tick macht this.lOut.set(out) / this.prevOut.set(out)).
+const _NN_H1=new Float32Array(NH), _NN_H2=new Float32Array(NH), _NN_OUT=new Float32Array(NO);
 function nnFwd(w,x){
   const o1=0,b1=NI*NH,o2=b1+NH,b2=o2+NH*NH,o3=b2+NH,b3=o3+NH*NO;
-  const h1=new Float32Array(NH);
+  const h1=_NN_H1,h2=_NN_H2,out=_NN_OUT;
   for(let j=0;j<NH;j++){let s=w[b1+j];for(let i=0;i<NI;i++)s+=x[i]*w[o1+j*NI+i];h1[j]=Math.tanh(s)}
-  const h2=new Float32Array(NH);
   for(let j=0;j<NH;j++){let s=w[b2+j];for(let i=0;i<NH;i++)s+=h1[i]*w[o2+j*NH+i];h2[j]=Math.tanh(s)}
-  const out=new Float32Array(NO);
   for(let j=0;j<NO;j++){let s=w[b3+j];for(let i=0;i<NH;i++)s+=h2[i]*w[o3+j*NH+i];out[j]=Math.tanh(s)}
   return{out}
 }
@@ -654,7 +671,12 @@ class SuctionCup{
   constructor(si){this.si=si;this.active=false;this.gripped=false;this.gx=0;this.gy=0;this.gTarget=null;this.gTime=0;this.constraint=null;this.load=0;this.cd=0;}
   tryGrip(pt,map,preys){
     if(this.gripped)return;
-    if(this.cd>0)return;
+    // BUG (war auch in ee24fb5 noch drin): `cd` wurde ausschließlich in
+    // applyConstraint() dekrementiert — und das läuft nur, solange `gripped`.
+    // Ein einziger Fehlversuch (z. B. Spitze zu schnell) setzte cd=0.05 und der
+    // Saugnapf war damit DAUERHAFT gesperrt. Das erklärt, warum die Anker-Rate
+    // trotz floorGrip bei ~30 % deckelte.
+    if(this.cd>0){ this.cd-=DT; return; }
     const tipLen = CONN_SL / 2;
     const angle = pt.body.angle;
     // Calculate global tip position for distance checks
@@ -806,7 +828,7 @@ class Connectarcle{
     this.hp=new Float32Array(CONN_SEGS).fill(100);
     this.active=CONN_SEGS-1;this.alive=true;
     this.nnAng=[0,0,0];this.worldRestAng=relAng;this.col='#00ffb3';
-    this.cups=[new SuctionCup(CONN_SEGS-1)];
+    this.cups=SUCTION_IDX.map(idx=>new SuctionCup(idx));
     this.suctionOn=false;
     this.suckLatch=false;   // Hysterese-Zustand des Saugnapfs
     this.constraints=[];
@@ -913,7 +935,7 @@ class Connectarcle{
   get tip(){return this.pts[Math.min(this.active,this.pts.length-1)]}
   get tipX(){const t=this.tip,a=t.body.angle,L=CONN_SL*0.5;return t.x+Math.cos(a)*L}
   get tipY(){const t=this.tip,a=t.body.angle,L=CONN_SL*0.5;return t.y+Math.sin(a)*L}
-  get tipCupGripped(){return this.cups[0]&&this.cups[0].gripped}
+  get tipCupGripped(){return this.cups.some(c=>c.gripped)}
 
   setTorques(t1,t2,t3){ this.nnTorques=[t1,t2,t3]; }
   /** Neue Steuerung: Schulter-Ziel, Ruhekrümmung, Wellenamplitude, CPG-Phase. */
@@ -923,7 +945,10 @@ class Connectarcle{
   /** metachronale Welle: Phase läuft von der Schulter zur Spitze */
   waveAt(i){
     const t=CONN_SEGS>1?i/(CONN_SEGS-1):0;
-    return Math.sin(this.phase-t*Math.PI*1.35)*this.ctrl.wave*JOINT_LIMIT;
+    const ph=this.phase-t*Math.PI*1.35;
+    const s=0.5+0.5*Math.sin(ph);
+    // asymmetrisch geformt: lange Streckphase, kurze kräftige Zugphase
+    return (Math.pow(s,PULL_ASYM)*2-1)*this.ctrl.wave*JOINT_LIMIT;
   }
 
   /**
@@ -1150,6 +1175,8 @@ class Organism{
     this.surfPress=0;this.bodyPress=0;this.echoSense=0;
     // NN IO
     this.lIn=new Float32Array(NI);this.lOut=new Float32Array(NO);this.prevOut=new Float32Array(NO);
+    this.prevVx=0;this.prevVy=0;   // Propriozeption: Eigenbeschleunigung
+    this.meanExtension=1;          // 0 = ganz eingerollt, 1 = ganz gestreckt
 
     // PERFECT RIGID BODY PHYSICS
     // Rumpfmasse 16. Bei reiner Arm-Fortbewegung sind die Arme Aktuatoren UND
@@ -1222,7 +1249,8 @@ class Organism{
   }
 
   buildInputs(preys){
-    const x=new Float32Array(NI);let i=0;
+    // this.lIn wiederverwenden statt pro Step und Organismus ein neues Array(104)
+    const x=this.lIn;x.fill(0);let i=0;
     // [0..7] Auditarcle deflections (echo + ambient sense)
     for(const a of this.auds)x[i++]=a.pressure||0;
     // [8] Peak echo pressure
@@ -1249,7 +1277,7 @@ class Organism{
     x[i++]=clamp(tc/N_CONN,0,1);
     // [32] Total grips active
     let gc=0;for(const c of this.conns)for(const s of c.cups)gc+=s.gripped?1:0;
-    x[i++]=clamp(gc/12,0,1);
+    x[i++]=clamp(gc/(N_CONN*SUCTION_IDX.length),0,1);
     // [33..34] Wall proximity
     const ar=H-BH-TH-MBH;
     x[i++]=clamp(1-Math.min(this.x,W-this.x)/W*4,0,1);
@@ -1262,6 +1290,41 @@ class Organism{
       let nd=9999;for(const p of preys){const d=Math.hypot(this.x-p.x,this.y-p.y);if(d<nd)nd=d}
       x[i++]=clamp(1-nd/500,0,1);this._preyMinDist=Math.min(this._preyMinDist,nd);
     }else x[i++]=0;
+
+    // ══ [37..72] PROPRIOZEPTION: 6 Arme × 6 Werte ══════════════════════
+    // Voraussetzung dafür, dass die KI ihren Körper verstehen kann. Sie muss
+    // den Kausalzusammenhang selbst beobachten können:
+    //   Arm einknicken → Zuglast steigt → Eigenbeschleunigung längs positiv.
+    const ca=Math.cos(-this.ang), sa=Math.sin(-this.ang);   // Welt → Rumpf-System
+    let anchored=0, extSum=0;
+    for(let k=0;k<N_CONN;k++){
+      const c=this.conns[k];
+      if(!c||!c.alive){ for(let q=0;q<6;q++) x[i++]=0; extSum+=0; continue; }
+      const s0=c.pts[0].body, tip=c.tip;
+      x[i++]=clamp(angDiff(s0.angle,this.ang)/SHOULDER_LIMIT,-1,1);        // [0] Schulterwinkel
+      let curlSum=0,cn=0;                                                  // [1] mittlere Krümmung
+      for(let j=1;j<=Math.min(c.active,c.pts.length-1);j++){
+        curlSum+=angDiff(c.pts[j].body.angle,c.pts[j-1].body.angle); cn++;
+      }
+      x[i++]=clamp((cn?curlSum/cn:0)/JOINT_LIMIT,-1,1);
+      const dx=tip.x-this.x, dy=tip.y-this.y;                              // [2..3] Spitze im Rumpf-System
+      x[i++]=clamp((dx*ca-dy*sa)/ARM_REACH,-1.2,1.2);
+      x[i++]=clamp((dx*sa+dy*ca)/ARM_REACH,-1.2,1.2);
+      x[i++]=clamp(c.tipContact||0,0,1);                                   // [4] Tastkontakt
+      x[i++]=clamp(c.gripLoad||0,0,1);                                     // [5] Zuglast (0 lose, 1 kurz vor Abriss)
+      if(c.cups.some(q=>q.gripped)) anchored++;
+      extSum += clamp(Math.hypot(dx,dy)/ARM_REACH,0,1);
+    }
+    this.meanExtension=extSum/N_CONN;
+
+    // ══ [73..76] globale Propriozeption ══
+    const acx=(this.vx-this.prevVx)/DT, acy=(this.vy-this.prevVy)/DT;      // Eigenbeschleunigung
+    x[i++]=clamp((acx*ca-acy*sa)/6,-1,1);      // längs — wird beim Ziehen deutlich positiv
+    x[i++]=clamp((acx*sa+acy*ca)/6,-1,1);      // quer
+    this.prevVx=this.vx; this.prevVy=this.vy;
+    x[i++]=anchored/N_CONN;                    // wie viele Arme tragen gerade
+    x[i++]=clamp(this.meanExtension,0,1);      // insgesamt gestreckt vs. eingerollt
+
     for(let k=0;k<NO;k++){ if(i<NI) x[i++]=this.prevOut[k]; }
     this.lIn=x;return x;
   }
@@ -1279,7 +1342,8 @@ class Organism{
     const inp=this.buildInputs(preys);
     const{out}=nnFwd(this.w,inp);
     if(!OVR.ai) out.fill(0);
-    this.lOut=out;this.prevOut.set(out);
+    // _NN_OUT ist ein GETEILTER Scratch-Puffer — Inhalt sofort in eigene Felder
+    this.lOut.set(out);this.prevOut.set(out);
 
     if(this._echoCooldown > 0) this._echoCooldown -= DT;
     if(out[26] > 0.5 && this._echoCooldown <= 0 && OVR.ai) {

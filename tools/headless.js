@@ -328,7 +328,9 @@ function measureOrganismStatic(o, steps) {
   const path = o.pathLen || 0;
   return {
     disp, path, angAcc: o.angularAccum || 0, rotations: (o.angularAccum || 0) / (Math.PI * 2),
-    gripTicks: o.gripCount || 0, spinGrip: 0, anchorPct: 0,
+    gripTicks: o.gripCount || 0,
+    // gripCount zählt pro Arm und Step → auf Arm-Schritte normieren
+    anchorPct: (o.gripCount || 0) / Math.max(1, steps * (dbg.N_CONN || 6)), spinGrip: 0,
     straightness: path > 1 ? disp / path : 0,
     forwardProg: o.forwardProg || 0, maxDisp: disp, gripPullProg: o.gripPullProg || 0,
     energySpent: o.energySpent || 0, wallHits: o.wallHits || 0, score: o.score(0), meanNet: disp,
@@ -548,6 +550,15 @@ bar('TEST 7 — NN EINGÄNGE / AUSGÄNGE');
     if (!re.test(src) && !(k >= 2 && k <= 25 && /out\[2\+k\*4\+/.test(src))) deadOut.push(k);
   }
   results.deadOutputs = deadOut;
+  // PROPRIOZEPTION: [37..72] = 6 Arme × 6 Werte (Schulterwinkel, Krümmung,
+  // Spitze x/y im Rumpfsystem, Tastkontakt, Zuglast). Ohne Gelenk-Feedback ist
+  // die KI blind für die eigene Armpose und kann kein Körpermodell aufbauen.
+  let propNonZero = 0;
+  for (let k = 37; k < 73; k++) if (Math.abs(inputs[k]) > 1e-6) propNonZero++;
+  results.proprioActive = propNonZero;
+  results.proprioTotal = inputs.length >= 104 ? 36 : 0;
+  log('  Propriozeption [37..72]: ' + propNonZero + '/36 Werte belegt' +
+      (inputs.length < 104 ? '  ❌ NI ist nur ' + inputs.length + ' — Propriozeption fehlt' : ''));
   results.inputUsage = { total: inputs.length, currentlyZero: constant };
   log('  Eingänge: ' + inputs.length + ' (davon gerade 0: ' + constant + ')');
   log('  Ausgänge: ' + o.lOut.length + ' | ungenutzt laut Quelltext: ' + (deadOut.length ? deadOut.join(',') : 'keine'));
@@ -583,6 +594,7 @@ const rows = [
   ['5   Tentakel kollidieren mit der Welt', results.tentacleOK],
   ['6   step() ohne Exception', !results.stepError],
   ['6   Keine toten kritischen Pfade', (results.deadSymbols || []).length === 0],
+  ['7   Propriozeption liefert Gelenk-Feedback', (results.proprioActive || 0) > 12],
   ['8   Performance > 100 steps/s (Echtzeit-tauglich)', results.perfOK],
 ];
 let pass = 0;
