@@ -6,6 +6,7 @@
 
   // Hoisted function exports: make controls available to window immediately
   const earlyControls = {
+    clearTraining, saveTraining,
     setMode, tryPlay, togglePause, setSp, toggleAutoSpeed, doReset,
     toggleEvo, forceMut, addPrey, clearPrey, newGen, nextPhase,
     setPhase, setPopSz, tog, rebuildMap, setMapRegen, exitPlay,
@@ -1825,6 +1826,34 @@ class Evolver{
     if(bf>this.bestFit){this.bestFit=bf;this.bestW=o0.w.slice()}
     else if(this.gen>0&&bf>this.bestFit*0.55&&this.bestW===null){this.bestW=o0.w.slice()}
     this.fitHist.push(bf);if(this.fitHist.length>80)this.fitHist.shift();
+
+    // ── TELEMETRIE: Kenngrößen dieser Generation ──
+    // Nicht nur der Score, sondern WAS ihn erzeugt. "Score steigt" allein ist
+    // wertlos, wenn er aus Zappeln kommt — deshalb Anker-Rate, Zug-Strecke und
+    // Geradlinigkeit getrennt.
+    {
+      const n=Math.max(1,this.orgs.length);
+      let sScore=0,sAnch=0,sPull=0,sDisp=0,sStr=0,sRot=0,sEff=0,sCyc=0;
+      const steps=Math.max(1,(this.orgs[0].age||DT)/DT);
+      for(const o of this.orgs){
+        sScore+=o.fitness;
+        sAnch +=(o.gripCount||0)/(steps*N_CONN);
+        sPull +=(o.gripPullProg||0);
+        sDisp +=(o.maxDisplacement||0);
+        sStr  +=(o.pathLen>1?(o.maxDisplacement/o.pathLen):0);
+        sRot  +=(o.angularAccum||0)/(Math.PI*2);
+        sEff  +=(o.forwardProg||0)/Math.max(0.5,o.energySpent||0);
+        sCyc  +=(o.gripCycles||0);
+      }
+      TELE.hist.push({
+        gen:this.gen, ph:this.phIdx,
+        best:bf, avg:sScore/n,
+        anchor:sAnch/n, pull:sPull/n, disp:sDisp/n,
+        straight:sStr/n, rot:sRot/n, eff:sEff/n, cycles:sCyc/n
+      });
+      if(TELE.hist.length>TELE.max) TELE.hist.shift();
+      if(this.gen%TELE.saveEvery===0) saveTraining();
+    }
     this.log.unshift(`G${this.gen} P${this.phIdx+1}: F=${bf.toFixed(1)} H=${o0.hits} GL=${o0.gripMoveDist.toFixed(0)} E=${o0.echoResponses}`);
     if(this.log.length>14)this.log.pop();
     this.gen++;this.phGenCnt++;this.mapRegenCnt++;
@@ -1905,7 +1934,58 @@ let paused=false,speed=1,autoEvo=true,popSz=MOB?6:8,mapRegenInterval=5;
 // cpgWave = false ist DEFAULT und bleibt es: keine handgeschriebene Gangkurve.
 // Der Schalter existiert nur, um den Unterschied messbar zu machen (A/B), nicht
 // weil das Spiel ihn braucht.
-const OVR={ch:true,sw:false,lt:false,col:false,ai:true,noCol:false,floorGrip:true,cpgWave:false,reflexGrip:true};
+const OVR={ch:true,sw:false,lt:false,col:false,ai:true,noCol:false,floorGrip:true,cpgWave:false,reflexGrip:true,tele:true};
+
+// ══════════════════════════════════════════════════════════════
+//  TELEMETRIE
+// ══════════════════════════════════════════════════════════════
+// saveEvery: alle 2 Generationen sichern. Ein Save serialisiert 5307 Floats
+// (~107 KB) — jede Generation wäre unnötiger GC-/IO-Druck während des Trainings.
+const TELE={hist:[], max:400, saveEvery:2};
+const LS_KEY='kraken_v2_training';
+
+/** Lineare Regression: Steigung pro Generation über die letzten n Punkte. */
+function trendOf(arr,n){
+  const a=arr.slice(-n);
+  const m=a.length;
+  if(m<3) return 0;
+  const mx=(m-1)/2;
+  let my=0; for(let i=0;i<m;i++) my+=a[i];
+  my/=m;
+  let num=0,den=0;
+  for(let i=0;i<m;i++){ num+=(i-mx)*(a[i]-my); den+=(i-mx)*(i-mx); }
+  return den?num/den:0;
+}
+
+function saveTraining(){
+  try{
+    if(typeof localStorage==='undefined'||!evlv) return;
+    localStorage.setItem(LS_KEY, JSON.stringify({
+      v:1, t:Date.now(),
+      bestW: evlv.bestW?Array.from(evlv.bestW):null,
+      bestFit: evlv.bestFit, gen: evlv.gen, phIdx: evlv.phIdx,
+      hist: TELE.hist.slice(-TELE.max)
+    }));
+  }catch(e){ /* QuotaExceeded / privater Modus — Training läuft ohne Speichern weiter */ }
+}
+
+function loadTraining(){
+  try{
+    if(typeof localStorage==='undefined') return false;
+    const raw=localStorage.getItem(LS_KEY);
+    if(!raw) return false;
+    const d=JSON.parse(raw);
+    if(!d||d.v!==1) return false;
+    if(Array.isArray(d.hist)) TELE.hist=d.hist.slice(-TELE.max);
+    return d;
+  }catch(e){ return false; }
+}
+
+function clearTraining(){
+  try{ if(typeof localStorage!=='undefined') localStorage.removeItem(LS_KEY); }catch(e){}
+  TELE.hist.length=0;
+  notify('TRAINING-STATUS GELOESCHT');
+}
 let _spsAcc=0,_spsT=0,_sps=0;
 
 function setMode(m){
@@ -2002,6 +2082,110 @@ function setMapRegen(v){mapRegenInterval=v}
 
 function flashEp(n,s=''){const el=document.getElementById('flv');if(el){const elN=el.querySelector('#fln');const elS=el.querySelector('#fls');if(elN)elN.textContent=n;if(elS)elS.textContent=s;el.style.opacity=1;clearTimeout(el._t);el._t=setTimeout(()=>el.style.opacity=0,2400)}}
 function notify(msg,t=2500){const el=document.getElementById('ntf');if(el){el.textContent=msg;el.style.opacity=1;clearTimeout(el._t);el._t=setTimeout(()=>el.style.opacity=0,t)}}
+
+// ─── TELEMETRIE-PANEL ─────────────────────────────────────
+const TP={x:10,y:52,w:392,h:196};
+
+function sparkline(x,y,w,h,vals,color,min,max){
+  if(vals.length<2)return;
+  const lo=min===undefined?Math.min.apply(null,vals):min;
+  const hi=max===undefined?Math.max.apply(null,vals):max;
+  const span=(hi-lo)||1;
+  ctx.save();
+  ctx.strokeStyle=color;ctx.lineWidth=1.4;ctx.beginPath();
+  for(let i=0;i<vals.length;i++){
+    const px=x+i/(vals.length-1)*w;
+    const py=y+h-((vals[i]-lo)/span)*h;
+    if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+/**
+ * Telemetrie-Panel. Zeichnet nicht nur den Score, sondern WAS ihn erzeugt:
+ * Anker-Rate, Zug-Strecke, Geradlinigkeit — und pro Kenngröße die Steigung
+ * einer linearen Regression über die letzten N Generationen. Damit ist
+ * "wird es besser?" eine Zahl und kein Eindruck aus dem Zuschauen.
+ */
+function drawTelemetry(){
+  if(!OVR.tele||!evlv||typeof ctx==='undefined'||!ctx)return;
+  const H_=TELE.hist;
+  const{x,y,w,h}=TP;
+  ctx.save();
+  ctx.fillStyle='rgba(0,6,4,.86)';ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle='rgba(0,255,179,.28)';ctx.lineWidth=1;ctx.strokeRect(x+.5,y+.5,w-1,h-1);
+  ctx.font='9px "Share Tech Mono",monospace';ctx.textAlign='left';ctx.textBaseline='top';
+
+  ctx.fillStyle='#00ffb3';
+  ctx.fillText('TELEMETRIE', x+8, y+7);
+  const ph=PHASES[evlv.phIdx];
+  ctx.fillStyle='#88ffcc';
+  ctx.fillText('GEN '+evlv.gen+'   PHASE '+(evlv.phIdx+1)+'/6 '+ph.name+'   POP '+evlv.orgs.length, x+8, y+19);
+  const prog=clamp(evlv.genT/Math.max(1,ph.dur),0,1);
+  ctx.fillStyle='#0f21';ctx.fillRect(x+8,y+31,w-16,3);
+  ctx.fillStyle='#00ffb3';ctx.fillRect(x+8,y+31,(w-16)*prog,3);
+
+  if(H_.length<3){
+    ctx.fillStyle='#0f68';
+    ctx.fillText('noch zu wenige Generationen fuer einen Trend ('+H_.length+'/3)', x+8, y+44);
+    ctx.restore();return;
+  }
+
+  const N=Math.min(60,H_.length);
+  const last=H_.slice(-N);
+  const cw=(w-24)/2, ch=58;
+
+  // Chart 1: Score (best hellgrün, avg blau)
+  const c1x=x+12, c1y=y+44;
+  ctx.strokeStyle='rgba(0,255,179,.12)';ctx.strokeRect(c1x+.5,c1y+.5,cw,ch);
+  const bests=last.map(d=>d.best), avgs=last.map(d=>d.avg);
+  const lo=Math.min.apply(null,avgs.concat(bests)), hi=Math.max.apply(null,bests);
+  sparkline(c1x,c1y,cw,ch,avgs,'rgba(120,180,255,.75)',lo,hi);
+  sparkline(c1x,c1y,cw,ch,bests,'#00ffb3',lo,hi);
+  ctx.fillStyle='#88ffcc';ctx.fillText('SCORE  best '+hi.toFixed(0)+' / avg '+lo.toFixed(0), c1x, c1y+ch+3);
+
+  // Chart 2: was den Score erzeugt
+  const c2x=x+12+cw+12, c2y=c1y;
+  ctx.strokeStyle='rgba(0,255,179,.12)';ctx.strokeRect(c2x+.5,c2y+.5,cw,ch);
+  sparkline(c2x,c2y,cw,ch,last.map(d=>clamp(d.anchor,0,1)),'#ffdd00',0,1);
+  sparkline(c2x,c2y,cw,ch,last.map(d=>clamp(d.straight,0,1)),'#00c8ff',0,1);
+  const pulls=last.map(d=>d.pull), pmax=Math.max.apply(null,pulls)||1;
+  sparkline(c2x,c2y,cw,ch,pulls,'#ff3a6e',0,pmax);
+  ctx.fillStyle='#88ffcc';ctx.fillText('ANKER / GERADE / ZUG', c2x, c2y+ch+3);
+
+  // Trend-Block: lineare Regression pro Kenngröße
+  const ty=y+44+ch+16;
+  const slope     = trendOf(H_.map(d=>d.best),N);
+  const slopePull = trendOf(H_.map(d=>d.pull),N);
+  const slopeAnch = trendOf(H_.map(d=>d.anchor),N);
+  const slopeRot  = trendOf(H_.map(d=>d.rot),N);
+  const l0=last[last.length-1];
+  const rowsT=[
+    ['Score/Gen',  (slope>=0?'+':'')+slope.toFixed(2),                 slope>0.5?'#00ffb3':(slope<-0.5?'#ff3a6e':'#ffdd00')],
+    ['Zug-px/Gen', (slopePull>=0?'+':'')+slopePull.toFixed(2),         slopePull>0?'#00ffb3':'#ff3a6e'],
+    ['Anker/Gen',  (slopeAnch>=0?'+':'')+(slopeAnch*100).toFixed(2)+'%', slopeAnch>0?'#00ffb3':'#ff3a6e'],
+    ['Umdreh/Gen', (slopeRot>=0?'+':'')+slopeRot.toFixed(3),           slopeRot<0?'#00ffb3':'#ff3a6e'],
+  ];
+  rowsT.forEach((r,i)=>{
+    const rx=x+12+(i%2)*((w-24)/2), ry=ty+Math.floor(i/2)*13;
+    ctx.fillStyle='#0f68';ctx.fillText(r[0], rx, ry);
+    ctx.fillStyle=r[2];ctx.fillText(r[1], rx+78, ry);
+  });
+
+  const by=ty+30;
+  ctx.fillStyle='#88ffcc';
+  ctx.fillText('aktuell: Anker '+(l0.anchor*100).toFixed(0)+'%   Zug '+l0.pull.toFixed(0)+'px   netto '+l0.disp.toFixed(0)+'px', x+12, by);
+  ctx.fillText('         gerade '+(l0.straight*100).toFixed(0)+'%   Umdreh '+l0.rot.toFixed(2)+'   Effizienz '+l0.eff.toFixed(2), x+12, by+12);
+
+  const verdict = slope>2 ? 'LERNT' : (slope>0.2 ? 'schwach positiv' : (slope<-0.2 ? 'REGREDIERT' : 'stagniert'));
+  ctx.fillStyle = slope>2?'#00ffb3':(slope>0.2?'#ffdd00':'#ff3a6e');
+  ctx.fillText('TREND ueber '+N+' Gen: '+verdict, x+12, by+26);
+  const budget=Math.max(1,evlv.orgs.length*ph.gpp);
+  ctx.fillStyle='#0f68';
+  ctx.fillText('Budget: '+budget+' Genome/Phase bei '+NSW+' Gewichten = '+Math.round(NSW/budget)+':1', x+12, by+38);
+  ctx.restore();
+}
 
 // ─── HUD ─────────────────────────────────────────────────
 let hudT=0;
@@ -2163,12 +2347,13 @@ function loop(ts){
       const best=evlv.getBest();
       for(const o of evlv.orgs)if(o!==best)o.draw(.25);
       best.draw(1);drawFX();
-      MAP.applyLighting();
+      MAP.applyLighting();drawTelemetry();
     } else {
       // Minimal draw to show it's running
       ctx.fillStyle='#00ffb3';
       ctx.font='14px Orbitron,monospace';
       ctx.fillText('AUTO SPEED ACTIVE: ' + ~~_sps + ' steps/sec', 20, H - 60);
+      drawTelemetry();
     }
   }else if(simMode==='PLAY'&&playS){
     playS.draw();drawFX();drawTouchUI();
@@ -2264,6 +2449,24 @@ function bootSimulation() {
     console.log('Initializing evolver with pop size:', popSz);
     evlv=new Evolver(popSz);
     evlv.init();
+    // Gespeichertes Training fortsetzen statt bei Generation 0 mit
+    // Zufallsgewichten anzufangen. Ohne das war jeder Reload ein Totalverlust.
+    {
+      const saved=loadTraining();
+      if(saved){
+        if(saved.bestW&&saved.bestW.length===NSW){ evlv.bestW=Float32Array.from(saved.bestW); }
+        if(typeof saved.bestFit==='number') evlv.bestFit=saved.bestFit;
+        if(typeof saved.gen==='number') evlv.gen=saved.gen;
+        if(typeof saved.phIdx==='number') evlv.phIdx=clamp(saved.phIdx,0,PHASES.length-1);
+        for(let i=0;i<evlv.orgs.length;i++){
+          evlv.orgs[i].w = evlv.bestW
+            ? nnMut(evlv.bestW, PHASES[evlv.phIdx].mut.r, PHASES[evlv.phIdx].mut.m)
+            : evlv.orgs[i].w;
+        }
+        setTimeout(()=>flashEp('TRAINING FORTGESETZT',
+          'Gen '+evlv.gen+' · Phase '+(evlv.phIdx+1)+' · Score '+(evlv.bestFit||0).toFixed(0)),900);
+      }
+    }
     
     console.log('Simulation ready, starting loop.');
     const popSel = document.getElementById('popsel');
@@ -2304,6 +2507,7 @@ function bootSimulation() {
 
     // Export symbols to window for HTML handlers
     const simControls = {
+      clearTraining, saveTraining,
       setMode, tryPlay, togglePause, setSp, toggleAutoSpeed, doReset,
       toggleEvo, forceMut, addPrey, clearPrey, newGen, nextPhase,
       setPhase, setPopSz, tog, rebuildMap, setMapRegen, exitPlay,

@@ -133,6 +133,18 @@ const sandbox = Object.assign(Object.create(null), windowStub, {
   Math, Date, JSON, Float32Array, Uint8Array, Uint8ClampedArray, Int32Array,
   Array, Object, Number, String, Boolean, isNaN, parseInt, parseFloat,
   Proxy, Map, Set, Error, RegExp, Symbol, Promise, process,
+  // localStorage-Stub: die Simulation speichert den Trainingsstand, damit ein
+  // Reload nicht bei Generation 0 mit Zufallsgewichten neu anfängt.
+  localStorage: (() => {
+    const m = new Map();
+    return { getItem: k => (m.has(k) ? m.get(k) : null),
+             setItem: (k, v) => m.set(k, String(v)),
+             removeItem: k => m.delete(k),
+             clear: () => m.clear(),
+             key: i => Array.from(m.keys())[i] ?? null,
+             get length() { return m.size; },
+             __dump: () => Object.fromEntries(m) };
+  })(),
 });
 sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
