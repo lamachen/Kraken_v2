@@ -79,6 +79,12 @@ export default function SimulationPage() {
         if (isCancelled) return;
 
         // 2. Load and boot simulation
+        // sim.js bootet sich am Dateiende selbst, sobald document.readyState
+        // 'interactive'/'complete' ist — was in einer Client-Component praktisch
+        // immer der Fall ist. Dieser Aufruf ist deshalb der ZWEITE Boot.
+        // sim.js hat dafür einen __simBooted-Guard; vorher entstanden zwei
+        // Evolver im selben Matter-World (gemessen: 527 statt 269 Bodies, also
+        // 6 unsichtbare Geister-Kraken, die nie getickt aber immer kollidiert sind).
         await loadScript('/sim.js?v=' + Date.now(), 'sim-engine-script');
         if (typeof (window as any).bootSimulation === 'function') {
           (window as any).bootSimulation();

@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "clean": "next clean"
+    "clean": "next clean",
+    "test:sim": "node tools/headless.js",
+    "test:sim:quick": "node tools/headless.js --quick"
   },
   "dependencies": {
     "@google/genai": "^1.50.1",

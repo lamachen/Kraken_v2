@@ -65,8 +65,63 @@ function initMatter() {
   return true;
 }
 const DT=1/60;
+
+// ══════════════════════════════════════════════════════════════
+//  PHYSIK-KALIBRIERUNG (gemessen an matter-js 0.20.0)
+//  Matter integriert mit deltaTimeSquared = (delta[ms])² = 277.78
+//    → Δv = (F / m) · 277.78   [px/step]
+//    → Δω = (τ / I) · 277.78   [rad/step]
+//  Alle Kräfte/Momente unten sind in diesen Einheiten kalibriert.
+// ══════════════════════════════════════════════════════════════
+const M_DT2      = 277.78;   // Matter's deltaTimeSquared bei 60 Hz
+const SUBSTEPS   = 2;        // Physik-Substeps pro Sim-Step (Constraint-Relaxation)
+const SUB_DT     = DT / SUBSTEPS;
+const SUB_COMP   = SUBSTEPS; // Impuls-Kompensation: τ_pro_Substep · SUBSTEPS · (dt/SUBSTEPS)² = τ · dt²
+
+const MAX_LIN_V  = 6.0;      // px/step  ≈ 360 px/s  — hartes Limit, verhindert "aus der Map fliegen"
+const MAX_ANG_V  = 0.20;     // rad/step für Tentakelsegmente
+const MAX_ANG_V_CORE = 0.025; // Mantel dreht träge (Lenkung kommt vom Trichter).
+// Warum das physikalisch stimmt: Ein Oktopus-Mantel ist breit und flach → sehr
+// hoher Rotations-Widerstand im Wasser. Ohne diese Dämpfung addieren sich die
+// Reaktionsmomente der 6 Arme zu einer Dauerdrehung, und der Jet zeichnet dann
+// einen Kreis (gemessen: 1049 px Pfad bei 30 px Netto = geschlossene Bahn).
+// Wasserwiderstand läuft über `frictionAir` im Matter-Integrator, NICHT über
+// nachträgliche setVelocity-Aufrufe (siehe Kommentar bei Pt.step()).
+const DRAG_CORE  = 0.075;    // Mantel
+const DRAG_SEG   = 0.085;    // Armsegmente (dünn, viele → mehr Reibung)
+const DRAG_PREY  = 0.090;    // Beute
+const DRAG_ANG   = 0.16;     // Reserve-Winkeldämpfung für Segmente
+const CORE_ANG_DRAG = 0.40;  // zusätzliche Mantel-Rotationsdämpfung als echtes Drehmoment
+
+const JET_MAX    = 0.85;     // Mantel-Stoß. Gesamtmasse ≈ 131 (Rumpf 26 + 6 Arme à 17.5),
+                             // der Stoß wirkt nur auf den Rumpf und zieht die Arme nach:
+                             // Δv_gesamt ≈ JET_MAX·277.8/131 ≈ 1.8 px/frame pro Puls.
+const FUNNEL_LEVER = 3.5;    // px — Hebelarm des Trichters vor dem Schwerpunkt.
+                             // Ein Oktopus lenkt, indem er den Siphon schwenkt: der
+                             // Strahl läuft dann nicht mehr durch den Schwerpunkt und
+                             // erzeugt ein Drehmoment. Ohne das könnte ein schwerer
+                             // Mantel seine Richtung überhaupt nicht mehr ändern.
+const JET_REFRACT= 0.30;     // s — Refraktärzeit; ~3.3 Stöße/s entspricht einem schwimmenden Oktopus
+const JET_THRESHOLD= 0.45;   // ab welchem out[0] der Mantel überhaupt zündet
+const MUSCLE_TMAX= 0.0045;   // max. Gelenkmoment (Segment-Trägheit ≈ 7 nach Geometrie-Fix → Δω ≈ 0.18 rad/step)
+const MUSCLE_KP  = 0.35;     // PD: proportional — per Sweep (tools/tune.js) bestimmt
+const MUSCLE_KD  = 0.50;     // PD: differential — per Sweep bestimmt, dämpft den Grenzzyklus
+const SHOULDER_TMAX = 0.014; // Schulter: Segment-Trägheit ≈ 10.5 → Δω ≈ 0.37 rad/step (wird
+                             // von MAX_ANG_V begrenzt), reicht um die ganze Armkette zu schwenken (eff. Trägheit ≈ 7×)
+
 const N_CONN=6,N_AUD=8;
 const CONN_SEGS=7,CONN_SL=13.5;
+// Gelenkwinkel-Limits (rad) — echte Cephalopoden-Arme knicken nicht beliebig
+const JOINT_LIMIT=Math.PI*0.42;
+const SHOULDER_LIMIT=Math.PI*0.62;
+
+// ─── CPG (Central Pattern Generator) ─────────────────────────
+// Erzeugt die metachronale Welle über alle Arme. Ohne diesen Rhythmus-
+// Prior muss die Evolution 27 chaotische Ausgänge gleichzeitig entdecken —
+// die stabilste lokale Lösung ist dann "im Kreis zappeln".
+const CPG_BASE_HZ=1.15;      // Grundfrequenz der Armwelle
+const CPG_WAVE_NUMBER=1.0;   // Phasenversatz pro Arm (1.0 = volle metachronale Welle)
+const DEBRIS=[];             // war undefiniert → latenter Crash in _damTent/takeDamage
 // Suction cups at tip, 57%, 28% of tentacle length
 const SUCTION_IDX = [CONN_SEGS];
 const NI=64,NH=32,NO=27;
@@ -74,12 +129,12 @@ const NSW=64*NH+NH+NH*NH+NH+NH*NO+NO;
 let NEXT_GROUP = -1;
 
 const PHASES=[
-  {id:0,name:'MOTOR PRIMITIVES',  sub:'Grip-and-pull locomotion',           preyN:0, pSpd:0,  dur:100,gpp:12,mut:{r:.18,m:.36}},
-  {id:1,name:'ECHOLOCATION',      sub:'Map corridors via echo pulses',      preyN:0, pSpd:0,  dur:90, gpp:10,mut:{r:.14,m:.28}},
-  {id:2,name:'CHEMOTAXIS',        sub:'Follow scent trails',                preyN:2, pSpd:.4, dur:80, gpp:8, mut:{r:.12,m:.22}},
-  {id:3,name:'ACTIVE PURSUIT',    sub:'Chase and grip prey',                preyN:3, pSpd:1.0,dur:80, gpp:8, mut:{r:.10,m:.18}},
-  {id:4,name:'EVASIVE PREY',      sub:'High-speed prey — commit',           preyN:2, pSpd:2.0,dur:80, gpp:8, mut:{r:.09,m:.16}},
-  {id:5,name:'FREE EMERGENCE',    sub:'All behaviors consolidate',          preyN:5, pSpd:1.3,dur:100,gpp:99,mut:{r:.07,m:.13}},
+  {id:0,name:'MOTOR PRIMITIVES',  sub:'Jet + arm-wave locomotion',          preyN:0, pSpd:0,  dur:100,gpp:12,mut:{r:.055,m:.16}},
+  {id:1,name:'ECHOLOCATION',      sub:'Map corridors via echo pulses',      preyN:0, pSpd:0,  dur:90, gpp:10,mut:{r:.045,m:.13}},
+  {id:2,name:'CHEMOTAXIS',        sub:'Follow scent trails',                preyN:2, pSpd:.4, dur:80, gpp:8, mut:{r:.04,m:.11}},
+  {id:3,name:'ACTIVE PURSUIT',    sub:'Chase and grip prey',                preyN:3, pSpd:1.0,dur:80, gpp:8, mut:{r:.035,m:.10}},
+  {id:4,name:'EVASIVE PREY',      sub:'High-speed prey — commit',           preyN:2, pSpd:2.0,dur:80, gpp:8, mut:{r:.03,m:.09}},
+  {id:5,name:'FREE EMERGENCE',    sub:'All behaviors consolidate',          preyN:5, pSpd:1.3,dur:100,gpp:99,mut:{r:.025,m:.08}},
 ];
 
 // ─── MATH ───────────────────────────────────────────────
@@ -98,7 +153,28 @@ const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
 const rnd=()=>Math.random();
 const rng=(a,b)=>a+(b-a)*rnd();
 function rgb(h){const r=h.replace('#','');return[parseInt(r.slice(0,2),16),parseInt(r.slice(2,4),16),parseInt(r.slice(4,6),16)]}
-function angDiff(a,b){let d=a-b;while(d>Math.PI)d-=Math.PI*2;while(d<-Math.PI)d+=Math.PI*2;return d}
+/**
+ * Winkel-Differenz auf (-π, π].
+ *
+ * ⚠ PERFORMANCE-KRITISCH: Die alte Fassung normalisierte mit
+ *     while(d>Math.PI) d-=Math.PI*2;
+ * Matter.js normiert `body.angle` aber NIE — der Wert wächst unbegrenzt.
+ * Nach ein paar hundert Schritten waren |angle| > 1e6 rad erreicht, die
+ * Schleife lief dann ~284.000 Durchgänge PRO AUFRUF. Bei 432 Aufrufen pro
+ * Sim-Schritt (6 Kraken × 6 Arme × 6 Gelenke × 2 Substeps) sind das über
+ * 100 Mio. Iterationen/Schritt → applyMuscles kostete 50 ms statt 0.05 ms
+ * und wurde mit jedem Frame langsamer.
+ * Der Restmodulo macht das O(1), unabhängig von der Winkelgröße.
+ */
+const TAU=Math.PI*2;
+function angDiff(a,b){
+  let d=(a-b)%TAU;
+  if(!Number.isFinite(d))return 0;
+  if(d>Math.PI)d-=TAU;else if(d<-Math.PI)d+=TAU;
+  return d;
+}
+/** Wickelt einen Winkel auf (-π, π] — für body.angle-Normalisierung. */
+function wrapAngle(a){let d=a%TAU;if(d>Math.PI)d-=TAU;else if(d<-Math.PI)d+=TAU;return d}
 
 // ─── NEURAL NETWORK ─────────────────────────────────────
 function nnNew(){const w=new Float32Array(NSW);for(let i=0;i<w.length;i++)w[i]=(rnd()-.5)*1.6;return w}
@@ -162,21 +238,29 @@ class Pt{
     const category = options.category || COL_TENTACLE;
     
     if (options.shape === 'capsule') {
-      // Subtract thickness from length because chamfer adds it back, 
-      // preventing the segments from overlapping at the joints.
-      const collisionLength = Math.max(1, options.length - options.thickness);
+      // ⚠ GEOMETRIE-BUG (Hauptursache der Instabilität):
+      //   collisionLength = max(1, length - thickness) = max(1, 13.5 - 11.9) = 1.6 px
+      //   bei 11.9 px Dicke, dazu chamfer radius = 5.95 > min(w,h)/2.
+      //   Ergebnis: ein degenerierter 1.6×11.9-Splitter mit inertia = 0.2
+      //   (korrekt wären ~9). Bei Rumpfmasse 30 ergab das ein Massen-/Trägheits-
+      //   verhältnis von 250:1 — Sequential-Impulse-Solver schleudern so etwas weg:
+      //   gemessen ω = 976 rad/step und |v| = 91 px/step im ALLERERSTEN Frame,
+      //   bei komplett deaktivierten Aktuatoren.
+      // Matter's chamfer rundet Ecken nach INNEN ab, es verlängert die Form nicht.
+      // Eine Kapsel ist also rectangle(L, T) mit chamfer radius ≤ T/2.
+      const collisionLength = Math.max(options.thickness * 1.02, options.length);
       this.body = Bodies.rectangle(x, y, collisionLength, options.thickness, {
         mass: m,
-        frictionAir: 0.05,
+        frictionAir: options.frictionAir !== undefined ? options.frictionAir : 0.05,
         isStatic: isStatic,
-        chamfer: { radius: options.thickness / 2 },
+        chamfer: { radius: Math.min(options.thickness * 0.48, collisionLength * 0.48) },
         collisionFilter: { category: category, mask: mask, group: options.group || 0 },
         ...options
       });
     } else {
       this.body = Bodies.circle(x, y, cr, {
         mass: m,
-        frictionAir: 0.05,
+        frictionAir: options.frictionAir !== undefined ? options.frictionAir : 0.05,
         isStatic: isStatic,
         collisionFilter: { 
           category: category, 
@@ -197,23 +281,82 @@ class Pt{
   get py(){ return this.body.positionPrev.y }
   set px(v){ this.body.positionPrev.x = v }
   set py(v){ this.body.positionPrev.y = v }
+
+  /**
+   * Kraft in "Spiel-Einheiten" (0..±350). Wird massenormiert, damit leichte
+   * Tentakelspitzen nicht 10× stärker beschleunigen als der schwere Körper.
+   * Früher: fester Faktor 0.0006 → Δv bis 116 px/step auf ein 0.5kg-Segment
+   * (= 7000 px/s). Das war die Explosion aus der Map.
+   */
   force(fx,fy){
-    const maxF = 350;
-    const cfx = clamp(fx, -maxF, maxF);
-    const cfy = clamp(fy, -maxF, maxF);
-    Body.applyForce(this.body, this.body.position, {x: cfx * 0.0006, y: cfy * 0.0006});
+    if(!Number.isFinite(fx)||!Number.isFinite(fy))return;
+    const cfx=clamp(fx,-350,350), cfy=clamp(fy,-350,350);
+    // Ziel-BESCHLEUNIGUNG statt Ziel-Kraft: F = m · a.
+    // Sonst beschleunigt ein 0.5 kg leichtes Spitzen-Segment 16× stärker
+    // als der 8 kg schwere Körper — genau das war die alte Explosion.
+    const k=this.body.mass*0.00055;
+    Body.applyForce(this.body,this.body.position,{x:cfx*k,y:cfy*k});
   }
+  /**
+   * Echtes Drehmoment. `Body.applyForce(b, b.position, f)` erzeugt KEIN
+   * Drehmoment (Hebelarm 0) — die alte "Muskel"-Implementierung hat also
+   * nur translationell geschoben und die Segmente nie rotiert.
+   */
+  torque(t){
+    if(!Number.isFinite(t))return;
+    this.body.torque += clamp(t,-1,1);
+  }
+  /**
+   * Sicherheitsnetz NACH Engine.update(): NaN-Guard, harte Limits, Winkel-Wrapping.
+   *
+   * ⚠ WICHTIG: Der Wasserwiderstand wird NICHT hier gemacht, sondern über
+   * `body.frictionAir` direkt im Matter-Integrator. Früher stand hier ein
+   * `Body.setVelocity(v * damp)` für JEDES der 258 Bodies in JEDEM Frame.
+   * Das überschreibt die Verlet-Historie (positionPrev), aus der der
+   * Constraint-Solver seine Impulse ableitet — bei einer Gelenkkette injectiert
+   * man so permanent Energie. Messbar als Dauer-Oszillation von 276 px Pfad
+   * bei einem komplett passiven Kraken. `frictionAir` dagegen wird von Matter
+   * konsistent VOR der Constraint-Lösung angewendet.
+   */
   step() {
-    const maxV = 11;
-    const v = this.body.velocity;
-    const spd = Math.hypot(v.x, v.y);
-    if(spd > maxV) {
-      Body.setVelocity(this.body, { x: (v.x / spd) * maxV, y: (v.y / spd) * maxV });
+    const maxAV = this.maxAV || MAX_ANG_V;
+    const b=this.body, v=b.velocity;
+    if(!Number.isFinite(v.x)||!Number.isFinite(v.y)||!Number.isFinite(b.position.x)||!Number.isFinite(b.position.y)
+       ||!Number.isFinite(b.angle)||!Number.isFinite(b.angularVelocity)){
+      Body.setPosition(b,{x:W*.5,y:(TH+H-BH)*.5});
+      Body.setVelocity(b,{x:0,y:0});
+      Body.setAngularVelocity(b,0);
+      b.force.x=0;b.force.y=0;b.torque=0;
+      return true; // repariert
     }
-    const av = this.body.angularVelocity;
-    if(Math.abs(av) > 0.3) {
-      Body.setAngularVelocity(this.body, Math.sign(av) * 0.3);
+    // Harte Limits — greifen nur im Ausnahmefall, nicht jeden Frame
+    const sp=Math.hypot(v.x,v.y);
+    if(sp>MAX_LIN_V){ const s=MAX_LIN_V/sp; Body.setVelocity(b,{x:v.x*s,y:v.y*s}); }
+    const av=b.angularVelocity;
+    if(Math.abs(av)>maxAV) Body.setAngularVelocity(b,Math.sign(av)*maxAV);
+    b.force.x=0;b.force.y=0;b.torque=0;
+    // Winkel einwickeln: cos/sin bleiben identisch, aber angDiff und alle
+    // Betragsvergleiche arbeiten mit kleinen Zahlen (numerisch sauberer).
+    if(Math.abs(b.angle)>50){
+      const wrapped=wrapAngle(b.angle);
+      const delta=wrapped-b.angle;
+      b.angle=wrapped;
+      b.anglePrev+=delta;      // Winkelgeschwindigkeit unverändert lassen
     }
+    return false;
+  }
+  /** Weiche Karte-Grenze: schiebt zurück statt hart abzuprallen. */
+  contain(pad){
+    const b=this.body, p=b.position;
+    const x0=pad, x1=W-pad, y0=TH+MBH+pad, y1=H-BH-pad;
+    if(p.x<x0||p.x>x1||p.y<y0||p.y>y1){
+      const nx=clamp(p.x,x0,x1), ny=clamp(p.y,y0,y1);
+      Body.setPosition(b,{x:nx,y:ny});
+      const v=b.velocity;
+      Body.setVelocity(b,{x:(p.x!==nx)?-v.x*0.25:v.x, y:(p.y!==ny)?-v.y*0.25:v.y});
+      return true;
+    }
+    return false;
   }
   vx(){ return this.body.velocity.x }
   vy(){ return this.body.velocity.y }
@@ -514,53 +657,75 @@ class Auditarcle{
 
 // ─── SUCTION CUP ──────────────────────────────────────────
 class SuctionCup{
-  constructor(si){this.si=si;this.active=false;this.gripped=false;this.gx=0;this.gy=0;this.gTarget=null;this.gTime=0;this.constraint=null;}
+  constructor(si){this.si=si;this.active=false;this.gripped=false;this.gx=0;this.gy=0;this.gTarget=null;this.gTime=0;this.constraint=null;this.load=0;this.cd=0;}
   tryGrip(pt,map,preys){
     if(this.gripped)return;
-    let target = null;
+    if(this.cd>0)return;
     const tipLen = CONN_SL / 2;
     const angle = pt.body.angle;
     // Calculate global tip position for distance checks
     const tx = pt.x + Math.cos(angle) * tipLen;
     const ty = pt.y + Math.sin(angle) * tipLen;
 
+    // Ein Saugnapf braucht KONTAKT und darf nicht wegrutschen
+    if(Vector.magnitude(pt.body.velocity) > 3.2) return;
+
+    let target = null;
     // Check preys first
-    for(const pr of preys){if(Math.hypot(tx-pr.x,ty-pr.y)<pr.r+12){target=pr; break;}}
-    
+    for(const pr of preys){if(pr&&Math.hypot(tx-pr.x,ty-pr.y)<pr.r+10){target=pr; break;}}
+
     // If no prey, must be near a wall to grip
-    if(!target && !map.wallCollide(tx, ty, 8)) return;
-    
+    if(!target && !map.wallCollide(tx, ty, 9)) { this.cd=0.08; return; }
+
     this.gripped=true;
     this.gTarget=target;
     this.gx=target?0:tx;
     this.gy=target?0:ty;
     this.gTime=0;
-    
+    this.load=0;
+
     this.constraint = Constraint.create({
       bodyA: pt.body,
       // PointA is the offset from body center. For a capsule, tip is at +length/2
-      pointA: { x: tipLen, y: 0 }, 
+      pointA: { x: tipLen, y: 0 },
       bodyB: target ? target.body : null,
       pointB: target ? {x:0,y:0} : {x: tx, y: ty},
-      stiffness: 0.22,
-      length: 2,
-      damping: 0.25
+      // 0.22 war Gummi: der Arm konnte 26 px ziehen ohne Halt.
+      // 0.9/length 0 = echter Ankerpunkt, an dem man sich abstützen kann.
+      stiffness: 0.9,
+      length: 0,
+      damping: 0.12,
+      angularStiffness: 1   // Saugnapf = Gelenk, keine Winkelkopplung
     });
+    // Dieselbe Matter-Eigenheit wie bei den Arm-Gelenken: `pointA` muss zum
+    // Erstellungszeitpunkt WELT-ausgerichtet sein, weil Matter es nur noch
+    // inkrementell um (bodyAngle - angleA) weiterdreht. Sonst sitzt der
+    // Grip-Anker um den Segmentwinkel verdreht neben der Spitze und der
+    // Solver reißt beim ersten Durchlauf am Arm.
+    {
+      const ca=Math.cos(angle), sa=Math.sin(angle);
+      this.constraint.pointA.x = tipLen*ca; this.constraint.pointA.y = tipLen*sa;
+      this.constraint.angleA = angle;
+      if (target && target.body) { this.constraint.pointB.x=0; this.constraint.pointB.y=0; this.constraint.angleB=target.body.angle; }
+    }
     World.add(world, this.constraint);
   }
   release(){
     if(this.constraint) World.remove(world, this.constraint);
-    this.constraint=null; this.gripped=false; this.gTarget=null; this.gTime=0;
+    this.constraint=null; this.gripped=false; this.gTarget=null; this.gTime=0; this.load=0; this.cd=0.12;
   }
-  applyConstraint(pt,orgMass){ 
+  applyConstraint(pt,orgMass){
     if(!this.gripped)return false;
     this.gTime += DT;
-    if(this.gTime > 2.2) { this.release(); return false; }
+    if(this.cd>0)this.cd-=DT;
+    if(this.gTime > 3.0) { this.release(); return false; }
     // Breaking force check from TIP position
     const tipLen = CONN_SL / 2;
     const tpos = { x: pt.x + Math.cos(pt.body.angle)*tipLen, y: pt.y + Math.sin(pt.body.angle)*tipLen };
-    const bl = this.gTarget ? Vector.magnitude(Vector.sub(tpos, this.gTarget.body.position)) : (this.constraint ? Vector.magnitude(Vector.sub(tpos, this.constraint.pointB)) : 999);
-    if(bl > 26) { this.release(); return false; }
+    const anchor = this.gTarget ? this.gTarget.body.position : this.constraint.pointB;
+    const bl = anchor ? Vector.magnitude(Vector.sub(tpos, anchor)) : 999;
+    this.load = clamp(bl/14,0,1);          // 0 = entspannt, 1 = kurz vor dem Abriss
+    if(bl > 14) { this.release(); return false; }
     return true;
   }
   draw(pt,col,suctionOn){
@@ -596,59 +761,83 @@ class Connectarcle{
   constructor(relAng, parentBody, group = 0){
     this.relAng=relAng;
     this.pts=[];
-    const ox = Math.cos(relAng)*24, oy = Math.sin(relAng)*24;
-    const startX = parentBody.position.x + ox, startY = parentBody.position.y + oy;
+    this.parent=parentBody;
+    this.group=group;
+    this.shoulderR=24;
 
+    // Muskel-/CPG-Zustand
+    this.nnTorques=[0,0,0];
+    this.ctrl={shoulder:0,curl:0,wave:0};
+    this.phase=0;
+    this.tipContact=0;
+    this.gripLoad=0;
+
+    // MASSENVERTEILUNG — war der Hauptgrund, warum der Jet nicht zog:
+    // lerp(2.0, 0.45) über 7 Segmente = 8.57 pro Arm × 6 Arme = 51 Einheiten,
+    // bei einem Mantel von 12. Also 81 % frei schlenkernde Masse: der Mantel-Stoß
+    // hat fast nur die Arme herumgeworfen statt den Körper zu schieben.
+    // Jetzt ~2.3 pro Arm × 6 = 14 vs. Mantel 12 → Arme 54 %, wie beim echten Tier,
+    // aber der Rumpf bleibt der dominante Trägheitskörper.
+    // Massen-Taper maximal ~1.8:1 über die Kette, und Rumpf:Segment0 ≈ 8:1.
+    // Sequential-Impulse-Solver werden ab ~10:1 instabil.
+    const m0=3.2;
     for(let i=0;i<CONN_SEGS;i++){
-      const m=lerp(2, 0.5, i/CONN_SEGS);
-      const thickness = lerp(12, 6, i/CONN_SEGS) * 0.99;
-      // mask: 0 means NO collision with anything (as requested: "entferne sämtliche collider bis auf körper")
-      const mask = 0; 
-      
-      const wa = relAng;
-      const distFromCenter = 24 + i * CONN_SL; 
-      let startX = parentBody.position.x + Math.cos(wa) * distFromCenter; 
-      let startY = parentBody.position.y + Math.sin(wa) * distFromCenter;
-      
-      const p = new Pt(startX, startY, m, thickness/2, false, { 
-        shape: 'capsule',
-        length: CONN_SL,
-        thickness: thickness,
-        group: group, 
-        mask: mask 
+      const m=lerp(m0,1.8,i/(CONN_SEGS-1));
+      const thickness=lerp(12,6,i/CONN_SEGS)*0.99;
+      const p=new Pt(0,0,m,thickness/2,false,{
+        shape:'capsule', length:CONN_SL, thickness,
+        category:COL_TENTACLE,
+        // Tentakel müssen die Welt SPÜREN können (Wände, Beute).
+        // `group` ist negativ → Kollision mit dem eigenen Körper bleibt aus,
+        // andere Kraken und Wände kollidieren aber normal.
+        mask:COL_WALL|COL_PREY,
+        group
       });
-      // Set the initial angle of the capsule to match the radial direction
-      Body.setAngle(p.body, wa);
+      p.body.friction=0.05;
+      p.body.restitution=0;
+      p.body.frictionAir=DRAG_SEG;   // Wasserwiderstand im Integrator (constraint-konsistent)
+      p.body.friction=0.06; p.body.frictionStatic=0.12; p.body.restitution=0;
+      p.maxAV=MAX_ANG_V;
       this.pts.push(p);
     }
-    
+
     this.hp=new Float32Array(CONN_SEGS).fill(100);
-    this.active=CONN_SEGS - 1;this.alive=true;
+    this.active=CONN_SEGS-1;this.alive=true;
     this.nnAng=[0,0,0];this.worldRestAng=relAng;this.col='#00ffb3';
-    this.cups=[new SuctionCup(6)]; // Only one suction cup at the end for clarity
+    this.cups=[new SuctionCup(CONN_SEGS-1)];
     this.suctionOn=false;
+    this.constraints=[];
 
-    this.constraints = [];
-    
-    // Anchor start of pts[0] to CORE
-    const shoulderR = 24; 
-    const ax = Math.cos(relAng)*shoulderR, ay = Math.sin(relAng)*shoulderR;
-    this.anchor = Constraint.create({
-      bodyA: parentBody, bodyB: this.pts[0].body,
-      pointA: { x: ax, y: ay }, pointB: { x: -CONN_SL/2, y: 0 },
-      stiffness: 0.9, length: 0
+    // Schulter-Anchor (pointA ist CORE-LOKAL, wird in layout() konsistent gesetzt)
+    this.anchor=Constraint.create({
+      bodyA:parentBody, bodyB:this.pts[0].body,
+      pointA:{x:this.shoulderR,y:0}, pointB:{x:-CONN_SL/2,y:0},
+      stiffness:1, length:0, damping:0.1,
+      // ⚠ angularStiffness: 1 ist ENTSCHEIDEND.
+      // Matters Default ist 0, und Constraint.solve() wendet dann eine
+      // Winkelkorrektur `bodyA.angle -= cross(pointA,b)/w * (1-angularStiffness)`
+      // an, die anglePrev NICHT mitnimmt → erzeugt Winkelgeschwindigkeit aus dem
+      // Nichts. Bei einer gekrümmten Gelenkkette (curl != 0) schaukelt sich das
+      // im allerersten Engine.update auf: gemessen max|v| = 69 px/step und
+      // max|omega| = 95 rad/step aus einem exakt kräftefreien Ruhezustand.
+      // angularStiffness: 1 schaltet den Term aus = echtes Scharnier
+      // (positionsgekoppelt, rotationsfrei). Danach: max|v| = 0.41, |omega| = 0.013.
+      angularStiffness: 1,
     });
-    World.add(world, this.anchor);
+    World.add(world,this.anchor);
 
-    for(let i=0;i<this.pts.length-1;i++) {
-      const c = Constraint.create({
-        bodyA: this.pts[i].body, bodyB: this.pts[i+1].body,
-        pointA: { x: CONN_SL/2, y: 0 }, pointB: { x: -CONN_SL/2, y: 0 },
-        length: 0, stiffness: 0.95
+    for(let i=0;i<this.pts.length-1;i++){
+      const c=Constraint.create({
+        bodyA:this.pts[i].body, bodyB:this.pts[i+1].body,
+        pointA:{x:CONN_SL/2,y:0}, pointB:{x:-CONN_SL/2,y:0},
+        length:0, stiffness:1, damping:0.1,
+        angularStiffness: 1,   // siehe Hinweis beim Schulter-Anchor
       });
       this.constraints.push(c);
-      World.add(world, c);
+      World.add(world,c);
     }
+    // Erst NACH dem Constraint-Aufbau legen → garantiert verletzungsfrei
+    this.layout(parentBody.position.x,parentBody.position.y,parentBody.angle,0.28);
   }
   destroy() {
     for(const p of this.pts) World.remove(world, p.body);
@@ -656,96 +845,139 @@ class Connectarcle{
     World.remove(world, this.anchor);
     for(const cup of this.cups) cup.release();
   }
-  initPos(bx, by, orgAng) {
-    const wa = orgAng + this.relAng;
-    this.worldRestAng = wa;
-    
-    // Start slightly further out to avoid core overlap
-    let currentX = bx + Math.cos(wa) * 32;
-    let startY = by + Math.sin(wa) * 32;
-    let currentAng = wa;
 
-    for(let i=0; i<this.pts.length; i++) {
-        this.pts[i].x = currentX;
-        this.pts[i].y = startY;
-        Body.setAngle(this.pts[i].body, currentAng);
-        
-        // Gentle curl instead of tight shell to prevent self-collision on spawn
-        currentAng += 0.35; 
-        currentX += Math.cos(currentAng) * CONN_SL;
-        startY += Math.sin(currentAng) * CONN_SL;
+  /**
+   * Matter.js rotiert `constraint.pointA`/`pointB` nur INKREMENTELL um
+   * (bodyAngle − constraint.angleA), wobei angleA/angleB bei Constraint.create()
+   * eingefroren werden. Die Punkte sind also "welt-ausgerichtet relativ zum
+   * Erstellungswinkel", NICHT echte Body-Lokalkoordinaten.
+   *
+   * Dieser Helper setzt beide Felder konsistent neu, damit layout() zu jedem
+   * Zeitpunkt aufgerufen werden kann (Spawn, NaN-Reparatur) und die Constraints
+   * danach exakt erfüllt sind. Ohne das war der Anchor um bis zu 48 px versetzt
+   * → der Solver katapultierte die Körper im allerersten Frame auf 83 px/step.
+   */
+  static syncConstraint(c, bodyA, pAx, pAy, bodyB, pBx, pBy){
+    const ca=Math.cos(bodyA.angle), sa=Math.sin(bodyA.angle);
+    c.pointA.x=pAx*ca-pAy*sa; c.pointA.y=pAx*sa+pAy*ca;
+    c.angleA=bodyA.angle;
+    const cb=Math.cos(bodyB.angle), sb=Math.sin(bodyB.angle);
+    c.pointB.x=pBx*cb-pBy*sb; c.pointB.y=pBx*sb+pBy*cb;
+    c.angleB=bodyB.angle;
+  }
+
+  /**
+   * Legt die Armkette so hin, dass ALLE Constraints exakt erfüllt sind.
+   *
+   * Der alte Code machte `pos += SL·u(θ)` und drehte θ danach um 0.35 rad —
+   * bei einem length-0-Gelenk ist das geometrisch unmöglich erfüllbar
+   * (gemessen: 12.4 px Schulter- + 2.4 px Segment-Fehler). Der Solver mit
+   * stiffness .95 hat die Arme dann in Frame 1 auseinandergerissen
+   * (gemessen: 63 px/step = 3800 px/s im allerersten Frame).
+   *
+   * Korrekt: halber Schritt zum Gelenk → drehen → halber Schritt zum nächsten Zentrum.
+   */
+  layout(bx,by,coreAngle,curl){
+    const th0=coreAngle+this.relAng;
+    // Schultergelenk in Weltkoordinaten
+    let jx=bx+Math.cos(th0)*this.shoulderR, jy=by+Math.sin(th0)*this.shoulderR;
+    let th=th0;
+    for(let i=0;i<this.pts.length;i++){
+      const ux=Math.cos(th), uy=Math.sin(th);
+      const cx=jx+ux*CONN_SL*0.5, cy=jy+uy*CONN_SL*0.5;
+      const p=this.pts[i];
+      Body.setAngle(p.body,th);
+      Body.setPosition(p.body,{x:cx,y:cy});
+      Body.setVelocity(p.body,{x:0,y:0});
+      Body.setAngularVelocity(p.body,0);
+      p.body.force.x=0;p.body.force.y=0;p.body.torque=0;
+      jx=cx+ux*CONN_SL*0.5; jy=cy+uy*CONN_SL*0.5;   // Gelenk i
+      th+=curl;                                     // nächster Segmentwinkel
+    }
+    this.worldRestAng=th0;
+    // Constraints NACH der Pose synchronisieren (Reihenfolge ist entscheidend)
+    const H=CONN_SL*0.5;
+    Connectarcle.syncConstraint(this.anchor, this.parent,
+      Math.cos(this.relAng)*this.shoulderR, Math.sin(this.relAng)*this.shoulderR,
+      this.pts[0].body, -H, 0);
+    for(let i=0;i<this.constraints.length;i++){
+      Connectarcle.syncConstraint(this.constraints[i], this.pts[i].body, H, 0, this.pts[i+1].body, -H, 0);
     }
   }
+  /** Kompatibilitäts-Wrapper (wird von Organism aufgerufen). */
+  initPos(bx,by,orgAng){ this.layout(bx,by,orgAng,0.28); }
+
   get tip(){return this.pts[Math.min(this.active,this.pts.length-1)]}
-  get tipContact(){return clamp(this.tip.spd()*12,0,1)}
+  get tipX(){const t=this.tip,a=t.body.angle,L=CONN_SL*0.5;return t.x+Math.cos(a)*L}
+  get tipY(){const t=this.tip,a=t.body.angle,L=CONN_SL*0.5;return t.y+Math.sin(a)*L}
   get tipCupGripped(){return this.cups[0]&&this.cups[0].gripped}
 
-  setTorques(t1,t2,t3){
-    this.nnTorques=[t1,t2,t3];
+  setTorques(t1,t2,t3){ this.nnTorques=[t1,t2,t3]; }
+  /** Neue Steuerung: Schulter-Ziel, Ruhekrümmung, Wellenamplitude, CPG-Phase. */
+  setControl(shoulder,curl,wave,phase){ this.ctrl.shoulder=shoulder;this.ctrl.curl=curl;this.ctrl.wave=wave;this.phase=phase; }
+  setBase(bx,by,orgAng){ this.worldRestAng=orgAng+this.relAng; }
+
+  /** metachronale Welle: Phase läuft von der Schulter zur Spitze */
+  waveAt(i){
+    const t=CONN_SEGS>1?i/(CONN_SEGS-1):0;
+    return Math.sin(this.phase-t*Math.PI*1.35)*this.ctrl.wave*JOINT_LIMIT;
   }
-  setBase(bx,by,orgAng){
-    const wa=orgAng+this.relAng;this.worldRestAng=wa;
+
+  /**
+   * ECHTE Muskeln: PD-Regler schreibt `body.torque`.
+   * Der alte Code benutzte `Body.applyForce(b, b.position, f)` — Hebelarm 0,
+   * also NULL Drehmoment. Segmente wurden nur verschoben, nie gebeugt.
+   */
+  applyMuscles(){
+    const n=this.active+1;
+    if(n<1||!this.alive)return;
+    const core=this.parent, s0=this.pts[0].body;
+
+    // ── Schulter ──
+    const relS=angDiff(s0.angle,core.angle);
+    const tgtS=clamp(this.ctrl.shoulder,-SHOULDER_LIMIT,SHOULDER_LIMIT);
+    const avS=s0.angularVelocity-core.angularVelocity;
+    let tauS=(MUSCLE_KP*(tgtS-relS)-MUSCLE_KD*avS);
+    tauS=clamp(tauS,-1,1)*SHOULDER_TMAX*SUB_COMP;
+    s0.torque+=tauS;
+    core.torque-=tauS;                    // Reaktion dreht den Mantel mit (physikalisch korrekt)
+
+    // ── Ellbogen-/Fingergelenke (interne Paare → kein Nettomoment auf den Körper) ──
+    for(let i=1;i<n;i++){
+      const A=this.pts[i-1].body, B=this.pts[i].body;
+      const rel=angDiff(B.angle,A.angle);
+      const tgt=clamp(this.ctrl.curl+this.waveAt(i),-JOINT_LIMIT,JOINT_LIMIT);
+      const av=B.angularVelocity-A.angularVelocity;
+      let tau=(MUSCLE_KP*(tgt-rel)-MUSCLE_KD*av);
+      tau=clamp(tau,-1,1)*MUSCLE_TMAX*SUB_COMP;
+      B.torque+=tau;
+      A.torque-=tau;
+    }
   }
 
   tick(map,preys,orgMass,bodyX,bodyY){
     if(!this.active){this.alive=false;return}
-    const n = this.active + 1;
+    const n=this.active+1;
 
-    // 1. Shoulder Joint (Base to Segment 1)
-    if(n > 1) {
-      const aBase = Math.atan2(this.pts[1].y - this.pts[0].y, this.pts[1].x - this.pts[0].x);
-      let baseAngle = angDiff(aBase, this.worldRestAng);
-      
-      let shoulderTorque = clamp(this.nnTorques[0], -1, 1) * 220; 
-      
-      const isAI = typeof OVR !== 'undefined' ? OVR.ai : true;
-      if (isAI) {
-        const shoulderLimit = Math.PI * 0.55;
-        if(baseAngle > shoulderLimit) shoulderTorque += (shoulderLimit - baseAngle) * 500;
-        if(baseAngle < -shoulderLimit) shoulderTorque += (-shoulderLimit - baseAngle) * 500;
-      } else {
-        shoulderTorque = 0;
-      }
-      shoulderTorque = clamp(shoulderTorque, -320, 320);
-      
-      const nxBase = -Math.sin(aBase), nyBase = Math.cos(aBase);
-      this.pts[1].force(nxBase * shoulderTorque, nyBase * shoulderTorque);
-      this.pts[0].force(-nxBase * shoulderTorque, -nyBase * shoulderTorque);
-    }
+    // ── echter Tast-Sinn an der Spitze (vorher: tip.spd()*12 = Quatsch) ──
+    const tx=this.tipX, ty=this.tipY;
+    const nearWall=map.wallCollide(tx,ty,7)?1:0;
+    let nearPrey=0;
+    if(preys)for(const pr of preys){if(pr&&Math.hypot(tx-pr.x,ty-pr.y)<pr.r+9){nearPrey=1;break}}
+    const contact=Math.max(nearWall,nearPrey);
+    this.tipContact=this.tipContact*0.7+contact*0.3;
 
-    // 2. Elbow and Wrist Joints
-    for(let i=1;i<n-1;i++){
-      const pr=this.pts[i-1],cu=this.pts[i],nx2=this.pts[i+1];
-      if(!pr || !cu || !nx2) continue;
-      const a1=Math.atan2(cu.y-pr.y,cu.x-pr.x);
-      const a2=Math.atan2(nx2.y-cu.y,nx2.x-cu.x);
-      let angle=angDiff(a2,a1);
-      
-      let aiTorque=0;
-      const isAI = typeof OVR !== 'undefined' ? OVR.ai : true;
-      if (isAI) {
-        if(i===1 || i===2) aiTorque = clamp(this.nnTorques[1], -1, 1) * 160;
-        else aiTorque = clamp(this.nnTorques[2], -1, 1) * 110;
-        
-        let limitTorque=0;
-        const limit=Math.PI/2;
-        if(angle>limit)limitTorque=(limit-angle)*400;
-        if(angle<-limit)limitTorque=(-limit-angle)*400;
-        
-        const totalTorque=clamp(aiTorque+limitTorque, -250, 250);
-        const nx=-Math.sin(a2),ny=Math.cos(a2);
-        nx2.force(nx*totalTorque,ny*totalTorque);
-        const px=-Math.sin(a1),py=Math.cos(a1);
-        pr.force(-px*totalTorque,-py*totalTorque);
-      }
-    }
-
+    // ── Saugnäpfe ──
     for(let ci=0;ci<this.cups.length;ci++){
       const cup=this.cups[ci];
       const si=Math.min(cup.si,n-1);const pt=this.pts[si];
       if(this.suctionOn&&!cup.gripped)cup.tryGrip(pt,map,preys);
       else if(!this.suctionOn&&cup.gripped)cup.release();
-      if(cup.gripped) cup.applyConstraint(pt, orgMass);
+      if(cup.gripped){
+        const held=cup.applyConstraint(pt,orgMass);
+        this.gripLoad=cup.load||0;
+        if(!held)this.gripLoad=0;
+      }else this.gripLoad*=0.8;
     }
   }
 
@@ -823,10 +1055,10 @@ function drawDebris(){}
 // ─── PREY ─────────────────────────────────────────────────
 class Prey{
   constructor(x,y,map,spd=1){
-    this.map=map;this.spd=spd;this.r=10;this.seed=rnd()*100;this.panic=0;this._st=0;this.mass=1.5;
+    this.map=map;this.spd=spd;this.r=10;this.seed=rnd()*100;this.panic=0;this._st=0;this.mass=1.5;this.hitCd=0;
     this.body = Bodies.circle(x, y, this.r, {
       mass: this.mass,
-      frictionAir: 0.05,
+      frictionAir: DRAG_PREY,
       collisionFilter: { category: COL_PREY, mask: COL_WALL | COL_CORE | COL_TENTACLE }
     });
     World.add(world, this.body);
@@ -835,13 +1067,34 @@ class Prey{
   get y(){return this.body.position.y}
   set x(v){Body.setPosition(this.body,{x:v,y:this.body.position.y})}
   set y(v){Body.setPosition(this.body,{x:this.body.position.x,y:v})}
+  // Vorher fehlten diese Getter komplett: `p.vx += tip.vx()*2` hat nur eine
+  // wirkungslose JS-Property erzeugt — der Tentakel-Schlag hat die Beute nie bewegt.
+  get vx(){return this.body.velocity.x}
+  get vy(){return this.body.velocity.y}
+  set vx(v){Body.setVelocity(this.body,{x:v,y:this.body.velocity.y})}
+  set vy(v){Body.setVelocity(this.body,{x:this.body.velocity.x,y:v})}
+  knock(dx,dy,power=1){
+    const v=this.body.velocity;
+    Body.setVelocity(this.body,{x:clamp(v.x+dx*power,-7,7),y:clamp(v.y+dy*power,-7,7)});
+  }
   tick(preds){
     let fx=0,fy=0;
-    for(const p of preds){const dx=this.x-p.x,dy=this.y-p.y,d=Math.hypot(dx,dy);if(d<1||d>320)continue;this.panic=Math.min(1,this.panic+.045);const s=(0.005+this.panic*0.01)/d;fx+=dx*s;fy+=dy*s}
+    for(const p of preds){
+      if(!p)continue;
+      const dx=this.x-p.x,dy=this.y-p.y,d=Math.hypot(dx,dy);
+      if(d<1||d>320)continue;
+      this.panic=Math.min(1,this.panic+.045);
+      const s=(0.0009+this.panic*0.0022)/d;   // ×5 schwächer: vorher war Beute schneller als der Kraken
+      fx+=dx*s;fy+=dy*s;
+    }
     this.panic=Math.max(0,this.panic-.012);
-    Body.applyForce(this.body, this.body.position, {x: fx + (rnd()-.5)*0.001, y: fy + (rnd()-.5)*0.001});
-    const mv = Vector.magnitude(this.body.velocity);
-    const ms = this.spd*(this.panic>.3?5:2.2);
+    // kleine Richtungs-Zufalls-Komponente → Beute wirkt lebendig, nicht wie eine Rakete
+    Body.applyForce(this.body, this.body.position, {x: fx + (rnd()-.5)*0.00012, y: fy + (rnd()-.5)*0.00012});
+    const v=this.body.velocity;
+    const mv = Math.hypot(v.x,v.y);
+    // Beute darf nie schneller sein als der Kraken (MAX_LIN_V), sonst ist
+    // Phase 4/5 unlernbar. Wasserwiderstand kommt aus frictionAir.
+    const ms = Math.min(MAX_LIN_V*0.55, this.spd*(this.panic>.3?2.1:1.25));
     if(mv > ms) Body.setVelocity(this.body, Vector.mult(Vector.normalise(this.body.velocity), ms));
     
     this._st-=DT;
@@ -855,6 +1108,25 @@ class Prey{
     ctx.beginPath();ctx.arc(this.x,this.y,this.r,0,Math.PI*2);
     const rg=ctx.createRadialGradient(this.x-3,this.y-3,1,this.x,this.y,this.r);rg.addColorStop(0,'#ffcc44');rg.addColorStop(.5,'#ff6600');rg.addColorStop(1,'#2a0800');ctx.fillStyle=rg;ctx.fill();ctx.restore();
   }
+}
+
+/**
+ * Misst beim Spawn, wieviel Freiraum um den Kraken herum überhaupt verfügbar ist.
+ *
+ * Ohne das ist die Fitness reine Lotterie: wer in einer Nische mit der Wand im
+ * Rücken spawnt, kann physikalisch nie weit kommen, und die Evolution selektiert
+ * Spawn-Glück statt Fortbewegung (gemessen: Score-Streuung 150..220 ohne Trend
+ * über 20 Generationen). `reach` normiert die zurückgelegte Distanz auf diesen
+ * Freiraum und macht Individuen damit vergleichbar.
+ */
+function computeSpawnReach(map,x,y){
+  let sum=0,best=0;const N=16;
+  for(let k=0;k<N;k++){
+    const a=k/N*Math.PI*2;let d=0;
+    while(d<420){ d+=10; if(map.wallCollide(x+Math.cos(a)*d,y+Math.sin(a)*d,11))break; }
+    sum+=d; if(d>best)best=d;
+  }
+  return Math.max(70,(sum/N)*0.55+best*0.45);
 }
 
 // ─── ORGANISM ─────────────────────────────────────────────
@@ -876,18 +1148,41 @@ class Organism{
     this.lIn=new Float32Array(NI);this.lOut=new Float32Array(NO);this.prevOut=new Float32Array(NO);
 
     // PERFECT RIGID BODY PHYSICS
-    this.pt = new Pt(x, y, 12, 18, false, { 
-      category: COL_CORE, 
+    // Rumpfmasse 26. Zusammen mit der reparierten Kapsel-Geometrie bleibt das
+    // Trägheitsverhältnis Rumpf→Segment0 bei ~8:1 (Solver-stabil) und der Rumpf
+    // ist trotzdem der dominante Richtungs-Anker.
+    this.pt = new Pt(x, y, 26, 18, false, {
+      category: COL_CORE,
       mask: COL_WALL | COL_PREY,
       group: this.group // Share the same negative group as tentacles to avoid self-stuckness
     });
+    this.pt.body.frictionAir=DRAG_CORE;
+    this.pt.body.restitution=0.02;
+    this.pt.body.friction=0.05;
+    this.pt.maxAV=MAX_ANG_V_CORE;    // Mantel: träge Rotation
+    // ⚠ KRITISCH: Der logische Winkel und der Matter-Winkel müssen IDENTISCH sein.
+    // Vorher: this.ang = random, body.angle = 0 → die Arme wurden an
+    // `orgAng+relAng` gespawnt, der Schulter-Anchor lag aber bei `relAng`.
+    // Ergebnis: 12.4 px Constraint-Verletzung → Solver reißt alles auseinander.
+    Body.setAngle(this.pt.body, this.ang);
+    Body.setInertia(this.pt.body, this.pt.body.inertia*2.5); // Mantel ist träge → dreht nicht gleich mit
     this.constraints = [];
 
     // Body components - Tentacles anchored directly to coreBody
-    this.conns=CONN_ANGS.map((a,i)=>{const c=new Connectarcle(a, this.pt.body, this.group);c.col=this.col;c.initPos(this.x,this.y,this.ang);return c;});
+    this.conns=CONN_ANGS.map((a,i)=>{const c=new Connectarcle(a, this.pt.body, this.group);c.col=this.col;c.cpgOffset=i*(Math.PI*2/N_CONN)*CPG_WAVE_NUMBER;return c;});
     this.auds=AUD_ANGS.map(a=>new Auditarcle(a));
     // Echolocation
     this._echoT=rng(.5,1.5);this._echoInterval=rng(1.0,2.2);this._echoCooldown=0;
+    // ── CPG / Jet ──
+    this.cpg=rnd()*Math.PI*2;      // zentrale Uhr der metachronalen Welle
+    this.cpgHz=CPG_BASE_HZ;
+    this.jetCharge=1;              // 0..1 Mantelfüllung
+    this.jetRefract=0;
+    this.jetCmd=0;this.jetAim=0;
+    this.lastJetV=0;
+    this._jetF=0;                  // Schub-Vektor für den nächsten Substep
+    this.faceAng=this.ang-Math.PI*0.5;
+    this.age=0;
     // Fitness metrics (comprehensive)
       this.fitness=0;this.hits=0;this.wallHits=0;this.chemSensed=0;this.stepCount=0;
     this.gripCount=0;this.echoResponses=0;
@@ -895,12 +1190,19 @@ class Organism{
     this.gripMoveDist=0;      // total distance moved while gripped (real locomotion)
     this.gripMoveCorr=0;      // ticks body moved meaningfully while gripped
     this.freeMoveDist=0;      // distance moved WITHOUT grip (penalized passive drift)
-    this.angularAccum=0;      // total rotation (spinning penalty)
+    this.angularAccum=0;      // total rotation (spinning penalty) — war NIE verdrahtet
+    this.pathLen=0;           // tatsächlich gelaufene Pfadlänge
+    this.forwardProg=0;       // Σ max(0, v·Richtung) — nur echte Vorwärtsbewegung
+    this.jetImpulse=0;        // aufgewendeter Jet-Schub
+    this.gripPullProg=0;      // Vorwärtsbewegung während ≥2 Armen halten
+    this.resets=0;
     // Exploration
     this.visited=new Uint8Array(28*20);
-    this.spawnX=x;this.spawnY=y;
+    this.spawnX=x;this.spawnY=y;this.spawnAng=this.ang;
+    this.spawnReach=computeSpawnReach(map,x,y);   // verfügbarer Freiraum für faire Fitness
     this.maxDisplacement=0;this.totalDisplacement=0;
     this._preyMinDist=9999;this.idleTicks=0;this.effectiveIdlePenalty=0;this.energySpent=0; this.idlePenalty=0; this.wallHits=0;
+    this.px=x;this.py=y;
   }
   destroy() {
     World.remove(world, this.pt.body);
@@ -929,10 +1231,10 @@ class Organism{
     const[lA,lB]=this.map.sampleLight(this.x,this.y);x[i++]=lA;x[i++]=lB;
     // [23..26] Internal states
     x[i++]=this.energy;x[i++]=this.satiation;x[i++]=this.discomfort;x[i++]=this.arousal;
-    // [27] Surface pressure
-    x[i++]=this.surfPress;
-    // [28] Body-wall pressure
-    x[i++]=this.bodyPress;
+    // [27..28] CPG-Phase — damit das Netz sich auf die Armwelle PHASENLOCKEN kann.
+    // (vorher: surfPress = duplikat von max([0..7]), bodyPress = immer 0 weil hx/hy hart auf false)
+    x[i++]=Math.sin(this.cpg);
+    x[i++]=Math.cos(this.cpg);
     // [29] Own speed
     x[i++]=clamp(Math.hypot(this.vx,this.vy)/4,0,1);
     // [30] Angular velocity
@@ -963,74 +1265,113 @@ class Organism{
     this.x = this.pt.x; this.y = this.pt.y;
     this.vx = this.pt.body.velocity.x; this.vy = this.pt.body.velocity.y;
     this.ang = this.pt.body.angle; this.av = this.pt.body.angularVelocity;
+    // Die Augen werden bei lokalem -y gezeichnet → das ist die "Blickrichtung".
+    // Jet-Schub und Vorwärts-Fitness benutzen dieselbe Achse, sonst lernt das
+    // Netz Fortbewegung in eine Richtung, die es optisch nicht gibt.
+    this.faceAng = this.ang - Math.PI*0.5;
     const mv = this.pt.spd();
-    // ── ECHOLOCATION PULSE TIMER ──
-    
 
     const inp=this.buildInputs(preys);
     const{out}=nnFwd(this.w,inp);
     if(!OVR.ai) out.fill(0);
     this.lOut=out;this.prevOut.set(out);
-    
+
     if(this._echoCooldown > 0) this._echoCooldown -= DT;
-    if(out[26] > 0.5 && this._echoCooldown <= 0) {
+    if(out[26] > 0.5 && this._echoCooldown <= 0 && OVR.ai) {
       this.emitPulse();
       this._echoCooldown = 0.5;
     }
 
-    
-    
+    // ══ CPG: metachronale Welle ══════════════════════════════
+    // Ohne diesen Rhythmus-Prior ist "im Kreis zappeln" die stabilste
+    // Lösung die die Evolution findet (gemessen: 198 Umdrehungen/Gen).
+    this.cpgHz = CPG_BASE_HZ*(0.7+0.6*this.arousal);
+    this.cpg = (this.cpg + Math.PI*2*this.cpgHz*DT) % (Math.PI*2);
 
-    // Tentacle control
+    // ══ JET-ANTRIEB (out[0]/out[1] waren vorher tote Ausgänge) ══
+    // Echter Cephalopoden-Antrieb: Mantel füllen → refraktär → Stoß.
+    this.jetCmd  = out[0];
+    this.jetAim  = clamp(out[1],-1,1)*0.95;   // Trichter lenkt den Strahl ±54° — so steuert ein Oktopus
+    if(this.jetRefract>0) this.jetRefract-=DT;
+    this.jetCharge=clamp(this.jetCharge+DT*2.1,0,1);
+    this._jetF=0;
+    // Schwelle 0.45 statt 0.2 und lineare Skalierung DARÜBER:
+    // Mit 0.2 feuerten ~100 % aller Zufallsgenome dauerhaft (gemessen 66 von 66
+    // möglichen Pulsen) — es gab also keinen Selektionsgradienten fürs Jeten.
+    const jc=(this.jetCmd-JET_THRESHOLD)/(1-JET_THRESHOLD);
+    if(jc>0 && this.jetRefract<=0 && this.jetCharge>0.4 && this.energy>0.05 && OVR.ai){
+      const strength=clamp(jc,0,1)*this.jetCharge*(0.45+0.55*this.energy);
+      this._jetF=JET_MAX*strength*SUB_COMP;
+      this.jetCharge=0; this.jetRefract=JET_REFRACT;
+      this.energy=clamp(this.energy-strength*0.055,0,1);
+      this.energySpent+=strength*1.6;
+      this.jetImpulse+=strength;
+      this.lastJetV=strength;
+      emitSound(this.x-Math.cos(this.faceAng)*20,this.y-Math.sin(this.faceAng)*20,strength*.5,'emit');
+      if(strength>.55) spawnFX(this.x-Math.cos(this.faceAng)*22,this.y-Math.sin(this.faceAng)*22,this.col,4);
+    }else this.lastJetV*=.85;
+
+    // ── Tentakel-Steuerung ──
     let gripNow=0;
-
     for(let k=0;k<N_CONN;k++){
       const c=this.conns[k];if(!c.alive)continue;
-      const baseT1 = out[2+k*4+0]||0;
-      const baseT2 = out[2+k*4+1]||0;
-      const baseT3 = out[2+k*4+2]||0;
-      let suctionOn = (out[2+k*4+3]||0) > 0.1;
+      const oShoulder = out[2+k*4+0]||0;   // Schulter-Zielwinkel
+      const oWave     = out[2+k*4+1]||0;   // Amplitude der metachronalen Welle
+      const oCurl     = out[2+k*4+2]||0;   // statische Ruhekrümmung
+      let suctionOn   = (out[2+k*4+3]||0) > 0.1;
       if (!OVR.ai) suctionOn = false;
 
       let eMult = 1.0;
       if (this.energy < 0.2) eMult = clamp(this.energy * 5, 0, 1);
       if (this.energy < 0.05) suctionOn = false;
 
-      // Energy calculation directly impacts cost! If tired, they expend less.
-      const effort = (Math.abs(baseT1) + Math.abs(baseT2) + Math.abs(baseT3)) / 3.0 * eMult;
-      const eCost = (effort * 0.0008) + (suctionOn ? 0.0002 : 0);
+      const effort = (Math.abs(oShoulder) + Math.abs(oWave) + Math.abs(oCurl)) / 3.0 * eMult;
+      const eCost = (effort * 0.00055) + (suctionOn ? 0.00016 : 0);
       this.energySpent += eCost * 10.0;
       this.energy -= eCost;
-      
-      c.setTorques(baseT1 * eMult, baseT2 * eMult, baseT3 * eMult);
+
+      c.setTorques(oShoulder*eMult, oWave*eMult, oCurl*eMult);   // (Legacy, wird noch gelesen)
+      c.setControl(
+        clamp(oShoulder*eMult,-1,1)*SHOULDER_LIMIT,
+        clamp(oCurl*eMult,-1,1)*JOINT_LIMIT*0.8,
+        clamp(0.5+oWave*eMult,0,1.6),
+        this.cpg + (c.cpgOffset||0)
+      );
       c.suctionOn=suctionOn;
       c.setBase(this.x,this.y,this.ang);
       c.tick(this.map,preys,this.mass,this.x,this.y);
       if(c.cups.some(s=>s.gripped)){this.gripCount++;gripNow++}
     }
 
-    
-    // ── MATTER.JS PHYSICS ──
-    // (Constraints & positions updated by engine)
-    
-    // ── LOCOMOTION QUALITY TRACKING ──
+    // ══ LOCOMOTION-QUALITÄT ══════════════════════════════════
+    // Vorher wurde `mv` (Betrag der Geschwindigkeit) aufsummiert. Damit ist
+    // KREISELN die optimale Strategie: konstante Geschwindigkeit, kein
+    // Drift-Penalty, Score steigt. Jetzt zählt nur noch die Projektion auf
+    // die Blickrichtung — Kreiseln liefert ≈ 0.
+    const dx=this.x-this.px, dy=this.y-this.py;
+    const stepDist=Math.hypot(dx,dy);
+    const fwd=dx*Math.cos(this.faceAng)+dy*Math.sin(this.faceAng);
+    this.pathLen+=stepDist;
+    if(fwd>0) this.forwardProg+=fwd;
+    this.angularAccum+=Math.abs(this.av);
     if(gripNow>0){
-      this.gripMoveDist+=mv;
-      if(mv>.12)this.gripMoveCorr++;
+      this.gripMoveDist+=Math.max(0,fwd);
+      if(fwd>.12)this.gripMoveCorr++;
+      if(gripNow>=2&&fwd>0)this.gripPullProg+=fwd;
     }else{
-      if(mv>.3)this.freeMoveDist+=mv; // body drifting without grip = penalized
+      if(stepDist>.3)this.freeMoveDist+=stepDist;
     }
 
     const hx=false, hy=false; // removed manual walls
     this.bodyPress*=0.83;
 
     // Displacement tracking
-    const actualMv=Math.hypot(this.x-(this.px||this.x),this.y-(this.py||this.y));
+    const actualMv=stepDist;
     this.px=this.x;this.py=this.y;
     if(actualMv<.15)this.idleTicks++;else this.idleTicks=0;
     if(this.idleTicks>30)this.effectiveIdlePenalty+=.03;
     this.maxDisplacement=Math.max(this.maxDisplacement,Math.hypot(this.x-this.spawnX,this.y-this.spawnY));
-    this.totalDisplacement+=mv;
+    this.totalDisplacement+=stepDist;
 
     // Exploration grid
     const gx=~~(this.x/W*28),gy=~~((this.y-TH-MBH)/(H-BH-TH-MBH)*20);
@@ -1047,14 +1388,57 @@ class Organism{
     CHEM.dep(this.x,this.y,.004);
 
     // Internal state updates
-    
-    // Passive recovery is high, but active drain (handled in tentacle loop) is severe. This forces burst movements.
-    this.energy=clamp(this.energy - mv*.0002 - Math.abs(this.av)*.0002 + .002, 0, 1);
-
+    this.energy=clamp(this.energy - mv*.00016 - Math.abs(this.av)*.0002 + .0022, 0, 1);
     this.satiation=clamp(this.satiation-.0002,0,1);
     this.discomfort=clamp(this.discomfort+((hx||hy)?.06:-.004),0,1);
-    this.arousal=lerp(this.arousal,mv*.2+Math.abs(this.av)*.14,.05);
+    this.arousal=lerp(this.arousal,clamp(mv*.2+Math.abs(this.av)*.14+this.lastJetV*.5,0,1),.05);
     this.fitness+=this.satiation*.36*DT+this.energy*.08*DT;
+  }
+
+  /** Wird pro Physik-Substep aufgerufen: Muskeln + Jet + Wasserwiderstand. */
+  applyMuscles(){
+    for(const c of this.conns) if(c.alive) c.applyMuscles();
+    const b=this.pt.body;
+    // Zusätzliche Rotationsdämpfung des Mantels — als physikalisches Drehmoment,
+    // damit Matter sie konsistent mit den Constraints integriert.
+    // τ = -c·ω·I/Δt²  (mit SUB_COMP, weil pro Substep applied)
+    b.torque -= CORE_ANG_DRAG*b.angularVelocity*b.inertia/M_DT2*SUB_COMP;
+    if(this._jetF){
+      // Trichter um jetAim geschwenkt → Strahl zeigt nicht mehr durch den
+      // Schwerpunkt → Drehmoment. Das ist die einzige Lenkachse des Kraken.
+      const aim=clamp(this.jetAim,-1,1);
+      const a=this.faceAng+aim*0.95;
+      const lever=FUNNEL_LEVER*aim;
+      const lat=a+Math.PI*0.5;
+      const ap={x:b.position.x+Math.cos(lat)*lever, y:b.position.y+Math.sin(lat)*lever};
+      Body.applyForce(b,ap,{x:Math.cos(a)*this._jetF,y:Math.sin(a)*this._jetF});
+    }
+  }
+
+  /**
+   * Sicherheitsnetz NACH Engine.update():
+   * Wasserwiderstand, harte Velocity-Limits, NaN-Reparatur, Kartenrand.
+   * `Pt.step()` existierte schon immer, wurde aber NIE aufgerufen —
+   * deshalb flogen die Kraken mit 3800 px/s aus der Map.
+   */
+  postPhysics(){
+    let repaired=false;
+    if(this.pt.step()) { repaired=true; this.resets++; }
+    if(this.pt.contain(14)) this.wallHits++;
+    for(const c of this.conns){
+      if(!c.alive)continue;
+      for(const p of c.pts){ if(p.step()) repaired=true; p.contain(6); }
+    }
+    if(repaired){
+      // nach einer NaN-Reparatur alle Gelenke sauber neu legen
+      for(const c of this.conns) c.layout(this.pt.x,this.pt.y,this.pt.body.angle,0.2);
+      Body.setVelocity(this.pt.body,{x:0,y:0});
+      Body.setAngularVelocity(this.pt.body,0);
+      this.px=this.pt.x;this.py=this.pt.y;
+    }
+    // Wandkontakt des Mantels spürbar machen
+    const bp=this.map.wallCollide(this.x,this.y,15);
+    if(bp){ this.bodyPress=Math.min(1,this.bodyPress+.25); this.discomfort=clamp(this.discomfort+.02,0,1); }
   }
 
   _damTent(){
@@ -1072,33 +1456,74 @@ class Organism{
 
   score(phId){
     const expl = this.visited.reduce((s,v)=>s+v,0)/560;
-    const echoBonus = this.echoResponses * 0.1;
-    const gripLoco = this.gripMoveDist * 3.5; // High reward for moving while gripped
-    const dispS = (this.maxDisplacement||0) * 0.5 + (this.totalDisplacement||0) * 0.02;
-    const driftPenalty = this.freeMoveDist * 0.2;
-    const wallP = this.wallHits * 0.5;
-    const idleP = this.effectiveIdlePenalty * 5.0; // Strong penalty for doing nothing
-    
-    // ENERGY PENALTY:
-    // This is the core of the efficiency learning.
-    // If energySpent is high but gripLoco is low, the score will be negative.
-    const energyPenalty = this.energySpent * 0.6;
-    
-    // If they are spending energy, they are at least trying. Reduce idle penalty so 'Try and fail' is better than 'Do nothing'.
-    const effectiveIdleP = Math.max(0, idleP - this.energySpent * 1.5);
+    const dur  = Math.max(1,(this.age||0));
+    const echoBonus = Math.min(this.echoResponses, 600) * 0.06;
+
+    // ══ SPAWN-UNABHÄNGIGE KERNMETRIKEN ══
+    // `maxDisplacement` allein ist pures Glück: wer in einer Nische mit Wand im
+    // Rücken spawnt, kann nie weit kommen — und die Evolution selektiert dann
+    // Spawn-Lotterie statt Fortbewegung (gemessen: Score schwankt 164..571 ohne
+    // Trend über 22 Generationen). Diese drei Größen sind lageunabhängig:
+    const steps = Math.max(1, Math.round((this.age||DT)/DT));
+    const meanSpeed   = this.pathLen/steps;                              // px/step
+    const directed    = this.pathLen>1 ? this.maxDisplacement/this.pathLen : 0;  // 0=zappeln, 1=geradeaus
+    const headingHold = 1 - clamp(this.angularAccum/(steps*MAX_ANG_V_CORE), 0, 1);
+    // gerichtete Reisegeschwindigkeit — durch Kreiseln NICHT farmbar
+    const cruiseSpeed = meanSpeed*directed;
+    // Anteil des VERFÜGBAREN Freiraums, der tatsächlich erreicht wurde (0..1.2).
+    // Spawn-fair: eine Nische zählt nicht gegen das Individuum.
+    const reach = clamp(this.maxDisplacement/Math.max(70,this.spawnReach||400), 0, 1.2);
+
+    // ══ Warum die alte Formel Kreiseln erzeugt hat ══
+    //   gripLoco = gripMoveDist*3.5  mit gripMoveDist = Σ|v| (solange IRGENDEIN
+    //   Arm hält). Drehen auf der Stelle liefert volles |v|, keinen Drift-Penalty
+    //   und fast keine Energie → Score steigt, Fortschritt = 0.
+    //   `angularAccum` wurde deklariert aber NIE hochgezählt, der Spin-Penalty
+    //   existierte also nur als Kommentar.
+    //   `effectiveIdleP = max(0, idleP − energySpent*1.5)` hat Energie-
+    //   Verschwendung sogar BELOHNT.
+    // ══════════════════════════════════════════════════
+    // `forwardProg` allein ist farmbar: vor/zurück zappeln auf der Stelle
+    // summiert nur die Vorwärts-Halbwellen. Netto-Verschiebung + neu betretene
+    // Rasterzellen sind nicht farmbar — wer im Kreis zappelt, bekommt 0.
+    // Gewichtung: Skill-Terme (lageunabhängig) dominant, Glücks-Term klein.
+    //   cruiseSpeed  = meanSpeed·directed     → schnell UND geradeaus  (Skill)
+    //   headingHold  = 1 − |ω|-Budget         → ruhiger Kurs           (Skill)
+    //   expl         = neu betretene Zellen   → bounded [0,1], vergleichbar
+    //   maxDisplacement                      → spawn-abhängig, nur Bonus
+    // Alle Terme sind lageunabhängig und einzeln nicht farmbar:
+    //   reach       → wieviel vom verfügbaren Raum erreicht wurde
+    //   directed    → Geradlinigkeit (Zappeln → 0, Kreiseln → 0)
+    //   headingHold → ruhiger Kurs
+    //   expl        → neu betretene Rasterzellen (bounded, vergleichbar)
+    //   meanSpeed   → überhaupt mobil sein (kleines Gewicht, sonst Zappel-Anreiz)
+    const travel   = reach*240 + directed*95 + headingHold*45 + expl*1800 + meanSpeed*40;
+    const gripLoco = this.gripPullProg*2.2;                 // Kriechen mit ≥2 Armen
+    const spinP    = this.angularAccum*0.55;                // JETZT verdrahtet
+    const wallP    = this.wallHits*0.35;                    // JETZT verdrahtet
+    const idleP    = this.effectiveIdlePenalty*4.0;
+    const cost     = this.energySpent*0.30;
+    // Effizienz: gerichtete Strecke pro aufgewendeter Energie
+    const eff      = (travel+gripLoco)/Math.max(0.6,this.energySpent);
+    // Chemotaxis: mittlerer Geruchswert statt endloser Summe
+    const chemAvg  = (this.chemSensed/Math.max(1,this.stepCount||1))*dur*0.35;
+    const preyNear = Math.max(0,(500-(this._preyMinDist||500))*0.06);
 
     switch(phId){
+      // Exploration ist der stärkste nicht-farmbare Anreiz: jede neu betretene
+      // Rasterzelle zählt genau einmal. Kreiseln → 0 neue Zellen.
       case 0: // Locomotion focus
-        return gripLoco + dispS + expl * 2 - energyPenalty - driftPenalty - wallP - effectiveIdleP;
+        return travel + gripLoco + eff*3 - spinP - wallP - idleP - cost;
       case 1: // Echo focus
-        return gripLoco + dispS + echoBonus * 15 + expl * 5 - energyPenalty - driftPenalty - wallP - effectiveIdleP;
+        return travel + gripLoco + eff*2 + echoBonus*10 - spinP - wallP - idleP - cost;
       case 2: // Hunting focus
-        const preyQ = this.hits * 15.0 + Math.max(0,(500-(this._preyMinDist||500))*0.1);
-        return this.chemSensed * 2.0 + preyQ + gripLoco + expl * 5 - energyPenalty - driftPenalty - wallP - effectiveIdleP;
+        return travel + gripLoco + chemAvg*6 + preyNear + eff*2 - spinP - wallP - idleP - cost;
       case 3:
       case 4:
-      default:
-        return this.hits * 25.0 + this.satiation * 20.0 + gripLoco * 2.0 - energyPenalty - wallP - effectiveIdleP;
+        return this.hits*25 + this.satiation*20 + travel*0.6 + gripLoco + preyNear*1.5 + eff*2 - spinP - wallP - idleP - cost;
+      default: // FREE EMERGENCE
+        return this.hits*30 + this.satiation*22 + travel*0.8 + gripLoco*1.2 + chemAvg*4
+             + echoBonus*6 + eff*3 - spinP*1.2 - wallP - idleP - cost;
     }
   }
 
@@ -1179,8 +1604,53 @@ function drawTouchUI(){
 // ─── EVOLVER ─────────────────────────────────────────────
 const MAP=new GameMap();
 
+/**
+ * Zentraler Physik-Schritt für TRAIN und PLAY.
+ *
+ * Reihenfolge ist wichtig:
+ *   1. Wahrnehmung + NN + CPG + Muskel-Zielwerte  (60 Hz, 1× pro Step)
+ *   2. Physik mit SUBSTEPS: Muskeln schreiben body.torque, dann Engine.update.
+ *      Mehrere Relaxations-Durchläufe halten die 42 Gelenke pro Kraken stabil —
+ *      das ist der Unterschied zwischen "organischer Arm" und "Peitschen-Explosion".
+ *   3. Sicherheitsnetz: Wasserwiderstand, Velocity-Clamp, NaN-Reparatur, Kartenrand.
+ *   4. Tentakel↔Beute-Kontakt.
+ */
+function stepPhysics(orgs, preys){
+  for(const o of orgs) if(o) o.tick(preys);
+  for(const p of preys) if(p) p.tick(orgs);
+
+  for(let s=0;s<SUBSTEPS;s++){
+    for(const o of orgs) if(o) o.applyMuscles();
+    Engine.update(engine, SUB_DT*1000);
+  }
+
+  for(const o of orgs) if(o) o.postPhysics();
+
+  // ── Tentakelspitze trifft Beute ──
+  for(const o of orgs){
+    if(!o) continue;
+    for(const p of preys){
+      if(!p) continue;
+      if(p.hitCd>0){ p.hitCd-=DT; continue; }
+      for(const c of o.conns){
+        if(!c.alive)continue;
+        const tip=c.tip; if(!tip) continue;
+        if(Math.hypot(tip.x-p.x,tip.y-p.y) < p.r+9 && tip.spd()>0.9){
+          // Vorher: `p.vx += tip.vx()*2` — Prey hatte gar keine vx/vy-Property,
+          // der Knockback ist also komplett verpufft.
+          p.knock(tip.vx(),tip.vy(),0.9);
+          p.panic=1; p.hitCd=0.6;
+          o.onHit();
+          spawnFX(p.x,p.y,'#ffcc44',5);
+          break;
+        }
+      }
+    }
+  }
+}
+
 class Evolver{
-  constructor(popSz){this.pop=popSz;this.orgs=[];this.preys=[];this.gen=0;this.phIdx=0;this.phGenCnt=0;this.mapRegenCnt=0;this.genT=0;this.bestFit=0;this.bestW=null;this.fitHist=[];this.log=[]}
+  constructor(popSz){this.pop=popSz;this.orgs=[];this.preys=[];this.gen=0;this.phIdx=0;this.phGenCnt=0;this.mapRegenCnt=0;this.genT=0;this.bestFit=0;this.bestW=null;this.fitHist=[];this.log=[];this.stepCount=0}
   get phase(){return PHASES[this.phIdx]}
   init(){CHEM.init();WAVES.w0&&WAVES.w0.fill(0);WAVES.w1&&WAVES.w1.fill(0);this._ng()}
   _ng(){
@@ -1202,13 +1672,14 @@ class Evolver{
     const bf=this.orgs[0].fitness;
     const o0=this.orgs[0];
     if(bf>this.bestFit){this.bestFit=bf;this.bestW=o0.w.slice()}
+    else if(this.gen>0&&bf>this.bestFit*0.55&&this.bestW===null){this.bestW=o0.w.slice()}
     this.fitHist.push(bf);if(this.fitHist.length>80)this.fitHist.shift();
     this.log.unshift(`G${this.gen} P${this.phIdx+1}: F=${bf.toFixed(1)} H=${o0.hits} GL=${o0.gripMoveDist.toFixed(0)} E=${o0.echoResponses}`);
     if(this.log.length>14)this.log.pop();
     this.gen++;this.phGenCnt++;this.mapRegenCnt++;
     if(this.mapRegenCnt>=mapRegenInterval){this.mapRegenCnt=0;MAP.build();CHEM.init();WAVES.w0&&WAVES.w0.fill(0);WAVES.w1&&WAVES.w1.fill(0);flashEp('MAP REGENERATED','adapting to new layout...')}
     const gpp=MOB?Math.max(3,this.phase.gpp-2):this.phase.gpp;
-    if(this.phGenCnt>=gpp&&this.phIdx<PHASES.length-1){this.phIdx++;this.phGenCnt=0;flashEp(this.phase.name,this.phase.sub);document.getElementById('psel').value=this.phIdx}
+    if(this.phGenCnt>=gpp&&this.phIdx<PHASES.length-1){this.phIdx++;this.phGenCnt=0;this.bestFit=0;flashEp(this.phase.name,this.phase.sub);const ps=document.getElementById('psel');if(ps)ps.value=this.phIdx}
     if(!autoEvo){this._ng();return}
     const nw=[this.orgs[0].w.slice()];if(this.pop>1)nw.push(this.orgs[1].w.slice());
     while(nw.length<this.pop){
@@ -1221,26 +1692,18 @@ class Evolver{
     this._ng();for(let i=0;i<this.orgs.length;i++)this.orgs[i].w=nw[i];
   }
   step(){
-    this.stepCount++;
+    // `this.stepCount++` auf undefined ergab NaN → `NaN % 12 === 0` ist false →
+    // CHEM.diffuse() lief im TRAIN-Modus NIE. Die Chemorezeptoren der Kraken
+    // haben also nie eine Diffusionsfahne gesehen (Phase 3 CHEMOTAXIS = tot).
+    this.stepCount=(this.stepCount||0)+1;
     if(this.stepCount % 12 === 0) CHEM.diffuse();
-    Engine.update(engine, DT * 1000);
     tickSounds(MAP);CHEM.decay();MAP.tick();
-    for(const p of this.preys) {
-      if(p) p.tick(this.orgs);
-    }
-    for(const o of this.orgs){
-      if(!o) continue;
-      o.tick(this.preys);
-      for(const p of this.preys){
-        if(!p) continue;
-        for(const c of o.conns){if(!c.alive)continue;const tip=c.tip;if(tip && Math.hypot(tip.x-p.x,tip.y-p.y)<p.r+8&&tip.spd()>1.0){p.vx+=tip.vx()*2;p.vy+=tip.vy()*2;p.panic=1;o.onHit()}}
-      }
-    }
+    stepPhysics(this.orgs,this.preys);
     tickFX();this.genT+=DT;
     if(this.genT>=this.phase.dur)this._evo();
   }
   getBest(){return this.orgs.reduce((b,o)=>o.fitness>b.fitness?o:b,this.orgs[0])}
-  setPhase(idx){this.phIdx=clamp(idx,0,PHASES.length-1);this.phGenCnt=0;this._ng();flashEp(this.phase.name,this.phase.sub)}
+  setPhase(idx){this.phIdx=clamp(idx,0,PHASES.length-1);this.phGenCnt=0;this.bestFit=0;this._ng();flashEp(this.phase.name,this.phase.sub)}
 }
 
 class PlaySession{
@@ -1251,21 +1714,35 @@ class PlaySession{
     for(let i=0;i<5;i++){const psp=MAP.randSpawn(14);this.preys.push(new Prey(psp.x,psp.y,MAP,1.1))}
     this.player=new Player(MAP);
   }
-  step(){ this.stepCount = (this.stepCount||0) + 1; if(this.stepCount % 12 === 0) CHEM.diffuse(); Engine.update(engine, DT * 1000); tickSounds(MAP); CHEM.decay(); MAP.tick();
-    for(const p of this.preys) if(p) p.tick([this.org,this.player]);
-    if(this.org) {
+  step(){
+    this.stepCount = (this.stepCount||0) + 1;
+    if(this.stepCount % 12 === 0) CHEM.diffuse();
+    tickSounds(MAP); CHEM.decay(); MAP.tick();
+    if(this.preys.length<4){const psp=MAP.randSpawn(14);this.preys.push(new Prey(psp.x,psp.y,MAP,1.1))}
+    // Player ist kein Matter-Body → eigene Beutelisten-Perspektive
+    const orgs = this.org ? [this.org] : [];
+    for(const p of this.preys) if(p) p.tick(this.player&&this.player.alive?[this.org,this.player]:orgs);
+    if(this.org) this.org.tick(this.preys);
+    for(let s=0;s<SUBSTEPS;s++){
+      if(this.org) this.org.applyMuscles();
+      Engine.update(engine, SUB_DT*1000);
+    }
+    if(this.org){
+      this.org.postPhysics();
       for(const c of this.org.conns){
         if(!c || !c.alive)continue;
+        const tip=c.tip; if(!tip) continue;
         for(const p of this.preys){
           if(!p) continue;
-          const tip=c.tip;
-          if(tip && Math.hypot(tip.x-p.x,tip.y-p.y)<p.r+8&&tip.spd()>1.0){p.vx+=tip.vx()*2.2;p.vy+=tip.vy()*2.2;p.panic=1;this.org.onHit()}
+          if(p.hitCd>0){ p.hitCd-=DT; continue; }
+          if(Math.hypot(tip.x-p.x,tip.y-p.y)<p.r+9&&tip.spd()>0.9){
+            p.knock(tip.vx(),tip.vy(),1.0); p.panic=1; p.hitCd=0.6; this.org.onHit();
+            spawnFX(p.x,p.y,'#ffcc44',5);
+          }
         }
       }
     }
-    if(this.preys.length<4){const psp=MAP.randSpawn(14);this.preys.push(new Prey(psp.x,psp.y,MAP,1.1))}
-    if(this.org) this.org.tick(this.preys);
-    if(this.player) this.player.tick([this.org]);
+    if(this.player) this.player.tick(orgs);
     tickFX();
   }
   draw(){MAP.draw();drawSounds();CHEM.draw();for(const p of this.preys)p.draw();this.org.draw(1);this.player.draw();MAP.applyLighting()}
@@ -1273,7 +1750,7 @@ class PlaySession{
 
 // ─── GLOBAL STATE ─────────────────────────────────────────
 let evlv=null,playS=null,simMode='TRAIN';
-let paused=false,speed=1,autoEvo=true,popSz=MOB?4:6,mapRegenInterval=5;
+let paused=false,speed=1,autoEvo=true,popSz=MOB?6:8,mapRegenInterval=5;
 const OVR={ch:true,sw:false,lt:false,col:false,ai:true,noCol:false};
 let _spsAcc=0,_spsT=0,_sps=0;
 
@@ -1319,7 +1796,7 @@ function toggleAutoSpeed(){
     document.getElementById('sv').textContent = speed + '×';
   }
 }
-function doReset(){CHEM.init();WAVES.w0&&WAVES.w0.fill(0);WAVES.w1&&WAVES.w1.fill(0);FX.length=0; if(evlv&&evlv.preys)for(const p of evlv.preys)p.destroy();if(playS&&playS.preys)for(const p of playS.preys)p.destroy();World.clear(world, false); MAP.build();evlv=new Evolver(popSz);evlv.init();playS=null;if(simMode==='PLAY')setMode('TRAIN');notify('RESET')}
+function doReset(){CHEM.init();WAVES.w0&&WAVES.w0.fill(0);WAVES.w1&&WAVES.w1.fill(0);teardownWorld();playS=null;MAP.build();evlv=new Evolver(popSz);evlv.init();if(simMode==='PLAY')setMode('TRAIN');notify('RESET')}
 function toggleEvo(){autoEvo=!autoEvo;const b=document.getElementById('bevo');if(b){b.textContent='EVO '+(autoEvo?'ON':'OFF');b.classList.toggle('on',autoEvo);}}
 function forceMut(){if(!evlv)return;const bw=evlv.getBest().w;for(const o of evlv.orgs)o.w=nnMut(bw,.28,.45);notify('FORCED MUTATION')}
 function addPrey(n){const m=simMode==='PLAY'&&playS?playS:evlv;if(!m)return;for(let i=0;i<n;i++){const sp=MAP.randSpawn(14);(simMode==='PLAY'?playS.preys:evlv.preys).push(new Prey(sp.x,sp.y,MAP,simMode==='PLAY'?1.1:evlv.phase.pSpd))}}
@@ -1341,21 +1818,26 @@ function tog(k){
 
 function updateAliensCollision() {
   const isNoCol = OVR.noCol;
-  const mask = isNoCol ? 0 : (COL_WALL | COL_PREY | COL_TENTACLE);
+  const bodyMask = isNoCol ? 0 : (COL_WALL | COL_PREY);
+  // Tentakel MÜSSEN Wände und Beute spüren, sonst kann ein Kraken sich
+  // nirgends abstützen und "Grip-and-pull"-Locomotion ist physikalisch unmöglich.
+  // Vorher: mask=0 + isSensor=true für alle 42 Segmente → Arme geisterten durch alles.
+  // Die negative `group` pro Organismus verhindert weiterhin Selbst-Kollision.
+  const tentMask = isNoCol ? 0 : (COL_WALL | COL_PREY);
   const targets = [];
   if(evlv) targets.push(...evlv.orgs);
   if(playS && playS.org) targets.push(playS.org);
-  
+
   for(const o of targets) {
     if(!o || !o.pt) continue;
-    // Essential: set isSensor to true to completely bypass physical resolving
     o.pt.body.isSensor = isNoCol;
-    o.pt.body.collisionFilter.mask = mask;
-    
+    o.pt.body.collisionFilter.mask = bodyMask;
+
     for(const c of o.conns) {
       for(const p of c.pts) {
-        p.body.isSensor = true; // Tentacles are always sensors currently, but enforced here
-        p.body.collisionFilter.mask = 0;
+        p.body.isSensor = isNoCol;
+        p.body.collisionFilter.mask = tentMask;
+        p.body.collisionFilter.group = o.group;
       }
     }
   }
@@ -1553,7 +2035,39 @@ function loop(ts){
 }
 
 // ─── BOOT ─────────────────────────────────────────────────
+/**
+ * Räumt den Matter-World komplett leer.
+ * Ohne das stapeln sich bei jedem Reset/Re-Boot ganze Populationen:
+ * gemessen 527 Bodies statt 269 — also 6 unsichtbare Geister-Kraken
+ * (258 Bodies), die nie getickt, nie gezeichnet, aber immer kollidiert sind.
+ */
+function teardownWorld(){
+  if(!world) return;
+  try{
+    if(evlv){ for(const o of evlv.orgs) if(o&&o.destroy)o.destroy(); for(const p of (evlv.preys||[])) if(p&&p.destroy)p.destroy(); }
+    if(playS){ if(playS.org&&playS.org.destroy)playS.org.destroy(); for(const p of (playS.preys||[])) if(p&&p.destroy)p.destroy(); if(playS.player&&playS.player.destroy)playS.player.destroy(); }
+  }catch(e){ /* Defensiv: Teardown darf nie den Boot blockieren */ }
+  World.clear(world, false);
+  MAP.walls=[]; MAP.matterWalls=[];
+  FX.length=0; DEBRIS.length=0;
+}
+
 function bootSimulation() {
+  // ── DOPPEL-BOOT-GUARD ──
+  // sim.js bootet sich am Dateiende selbst (readyState ist in einer Next.js
+  // Client-Component bereits 'interactive'), UND app/page.tsx ruft
+  // bootSimulation() nochmal auf. Zwei Evolver im selben World = Geister-Kraken.
+  if (window.__simBooted) {
+    // Nicht einfach ignorieren: React StrictMode (next.config.ts reactStrictMode:true)
+    // mountet Effekte im Dev-Build DOPPELT, und der Cleanup-Handler in app/page.tsx
+    // ruft cancelAnimationFrame(window._simLoopId) auf. Ohne Neustart des Loops wäre
+    // die Simulation im Dev-Modus nach dem zweiten Mount eingefroren.
+    console.log('bootSimulation(): bereits gebootet — nur den Render-Loop neu gestartet.');
+    if (window._simLoopId) cancelAnimationFrame(window._simLoopId);
+    lastT = performance.now();
+    window._simLoopId = requestAnimationFrame(loop);
+    return;
+  }
   console.log('sim.js bootSimulation starting...');
   if (!initMatter()) {
     console.warn("Matter not initialized yet, retrying in 100ms...");
@@ -1569,7 +2083,12 @@ function bootSimulation() {
   try {
     console.log('Calling initial resize...');
     resize();
-    
+
+    // Teardown MUSS vor MAP.build() laufen: World.clear() entfernt auch die
+    // Wände. Vorher lag der Aufruf dahinter → die Simulation startete ohne
+    // einzige Wand (nichts zum Festhalten = keine Fortbewegung möglich).
+    teardownWorld();
+
     console.log('Building map...');
     MAP.build();
     
@@ -1585,6 +2104,7 @@ function bootSimulation() {
       cv.addEventListener("click",e=>{ const lp = toLog(e.clientX, e.clientY); if(simMode==="PLAY"&&playS?.player.alive){playS.player.atk(lp.x,lp.y,[playS.org]);return} if(simMode==="TRAIN")addPrey(1)});
     }
     
+    window.__simBooted = true;
     console.log('Initializing evolver with pop size:', popSz);
     evlv=new Evolver(popSz);
     evlv.init();
@@ -1641,7 +2161,9 @@ function bootSimulation() {
     window.addEventListener('keydown',e=>{KEYS[e.code]=true;if(e.code==='Space'){e.preventDefault();togglePause()}if(e.code==='KeyR')doReset();if(e.code==='BracketRight')setSp(Math.min(200,speed+5));if(e.code==='BracketLeft')setSp(Math.max(1,speed-3));if(e.code==='KeyF')tryPlay();if(e.code==='Escape'&&simMode==='PLAY')exitPlay()});
     window.addEventListener('keyup',e=>KEYS[e.code]=false);
 
-    if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    if (window.__simBooted) {
+      console.log('Simulation already booted by page.tsx — self-boot übersprungen.');
+    } else if (document.readyState === 'complete' || document.readyState === 'interactive') {
       console.log('Document already ready, booting simulation...');
       bootSimulation();
     } else {
